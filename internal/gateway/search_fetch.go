@@ -32,6 +32,8 @@ import (
 // given as Markdown-like text, other text as it is, anything else refused.
 // A long page comes in parts of max_chars characters, offset naming where
 // the next starts.
+// When Settings explicitly names a ChatGPT account's backend search,
+// its open is a fallback when the download fails or shows a verification page.
 
 const fetchMCPTool = "web_fetch"
 
@@ -88,10 +90,38 @@ func (s *Server) fetchMCPRun(r *http.Request, a fetchArgs) (string, error) {
 	ctx, cancel := context.WithTimeout(netproxy.With(r.Context(), ""), webFetchTimeout)
 	defer cancel()
 	title, text, final, err := fetchPage(ctx, u)
-	if err != nil {
-		return "", searchMCPError("couldn't fetch " + u.Redacted() + ": " + err.Error())
+	if err == nil && strings.TrimSpace(text) != "" && !fetchVerification(text) {
+		return fetchPart(final, title, text, a.Offset, limit), nil
 	}
-	return fetchPart(final, title, text, a.Offset, limit), nil
+	failure := "couldn't read " + u.Redacted() + ": the site showed a verification page instead of the content"
+	if err == nil && strings.TrimSpace(text) == "" {
+		failure = "couldn't read " + u.Redacted() + ": the page had no text"
+	}
+	if err != nil {
+		failure = "couldn't fetch " + u.Redacted() + ": " + err.Error()
+	}
+	if p, model, why := chosenSearcher(); why == "" && p != nil && model == codexSearchModel && codexSearches(*p) {
+		// The download may have spent its whole deadline. Open gets its own.
+		if title, text, err := s.codexFetch(r.Context(), *p, raw); err == nil {
+			return fetchPart(u.Redacted(), title, text, a.Offset, limit), nil
+		}
+	}
+	return "", searchMCPError(failure)
+}
+
+// Short challenge pages are not the content the caller asked to read.
+func fetchVerification(text string) bool {
+	text = strings.Join(strings.Fields(text), "")
+	if utf8.RuneCountInString(text) > 1500 {
+		return false
+	}
+	text = strings.ToLower(text)
+	for _, marker := range []string{"环境异常", "完成验证后即可继续访问", "notarobot", "verifyyouarehuman", "justamoment...", "attentionrequired!|cloudflare"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchPart is what web_fetch answers: where the page was read from, its
