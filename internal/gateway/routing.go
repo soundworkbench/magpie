@@ -949,10 +949,12 @@ func narrowWhenRead(c candidate, r Rest) {
 	}
 }
 
-// keyAllowance and staleKeyAllowance are provider.KeyAllowance and
+// keyAllowance, remoteAllowance and staleKeyAllowance are
+// provider.KeyAllowance, provider.RemoteAllowance and
 // provider.StaleKeyAllowance, swapped in tests.
 var (
 	keyAllowance      = provider.KeyAllowance
+	remoteAllowance   = provider.RemoteAllowance
 	staleKeyAllowance = provider.StaleKeyAllowance
 )
 
@@ -2052,13 +2054,23 @@ func (c candidate) creditsLast(now time.Time) bool {
 
 // allowance is the candidate's allowance as last known: a subscription
 // account's, or a key's own windows when magpie reads them (a sub2api
-// key's limits, provider.KeyAllowance). ok is false when it isn't known.
+// key's limits, provider.KeyAllowance; a Remote magpie's account,
+// provider.RemoteAllowance). ok is false when it isn't known.
 func (c candidate) allowance() (provider.Allowance, bool) {
 	if a := c.p.Account; a != nil {
 		al, ok := allowances(a.UsageAgent())[a.User]
 		return al, ok
 	}
-	return keyAllowance(c.p)
+	return c.keyWindows()
+}
+
+// keyWindows is a key's own windows, else, for a Remote magpie, those of
+// its account that serves the candidate's model.
+func (c candidate) keyWindows() (provider.Allowance, bool) {
+	if a, ok := keyAllowance(c.p); ok {
+		return a, true
+	}
+	return remoteAllowance(c.p, c.model)
 }
 
 // keepRetry passes on, with a vendor's error, what it said about when to
@@ -2383,9 +2395,10 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 		var ok bool
 		whose := c.p.ID // whose wallet a balance is in
 		if c.p.Account == nil {
-			// a key that reads its own windows is weighed by them as an
+			// a key that reads its own windows, or a Remote magpie whose
+			// account's cards are kept here, is weighed by them as an
 			// account is; any other key isn't known
-			a, ok = keyAllowance(c.p)
+			a, ok = c.keyWindows()
 		} else {
 			ag := c.p.Account.UsageAgent()
 			whose = ag
