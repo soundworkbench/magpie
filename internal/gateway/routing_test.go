@@ -16,6 +16,7 @@ import (
 func init() {
 	allowances = func(string) map[string]provider.Allowance { return nil }
 	keyAllowance = func(provider.Provider) (provider.Allowance, bool) { return nil, false }
+	remoteAllowance = func(provider.Provider, string) (provider.Allowance, bool) { return nil, false }
 }
 
 func restsOf(cs []candidate) string {
