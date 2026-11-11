@@ -2348,7 +2348,11 @@ func (p Provider) Ready() bool {
 // On is whether the provider takes requests: ready, not switched off,
 // not kept to its agent's own sign-in (KeptToAgent) and not a Remote
 // magpie that is this magpie (SelfLeftOut).
-func (p Provider) On() bool { return p.Ready() && !p.Off && !p.KeptToAgent() && !p.SelfLeftOut() }
+func (p Provider) On() bool { return p.Ready() && !p.switchedOff() }
+
+// switchedOff identifies providers whose requests get a specific refusal,
+// even when they are not ready.
+func (p Provider) switchedOff() bool { return p.Off || p.KeptToAgent() || p.SelfLeftOut() }
 
 // KeptToAgent is whether the provider is Claude's subscription with
 // SwitchOnly on: its accounts are Claude Code's own sign-in alone, which
@@ -2378,12 +2382,12 @@ func SetOff(id string, off bool) error {
 func SwitchedOff(id string) (Provider, bool) {
 	id = strings.TrimSuffix(strings.TrimSpace(id), "[1m]")
 	if pid, _, ok := strings.Cut(id, "/"); ok {
-		if p, err := Find(pid); err == nil && (p.Off || p.KeptToAgent() || p.SelfLeftOut()) {
+		if p, err := Find(pid); err == nil && p.switchedOff() {
 			return *p, true
 		}
 	}
 	for _, p := range All() {
-		if !p.Off && !p.KeptToAgent() && !p.SelfLeftOut() || !p.Ready() {
+		if !p.switchedOff() || !p.Ready() {
 			continue
 		}
 		if slices.ContainsFunc(p.Exposed(), func(m catalog.Model) bool { return m.ID == id }) {
