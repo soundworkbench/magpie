@@ -86,8 +86,10 @@ func replayHome(t *testing.T, records []usage.Record) {
 			models[pid] = append(models[pid], model)
 		}
 	}
-	// Seed only the temporary catalog, including reserved subscription ids.
-	// Save validates new user providers, which these historical ids are not.
+	// For replay only, write temporary providers.json directly, intentionally
+	// bypassing provider.Save validation, including for reserved subscription ids.
+	// Any request with nonempty parts on both sides of its first slash seeds
+	// that prefix as a provider.
 	var ps []provider.Provider
 	for _, id := range sortedReplayKeys(models) {
 		ps = append(ps, provider.Provider{ID: id, Name: id, Key: "replay", Chat: "http://127.0.0.1:1/v1", Models: models[id]})
@@ -107,6 +109,9 @@ func replayModel(r usage.Record) string {
 	}
 	// Local rejections name only the requested model. Keep the record itself
 	// unchanged so IsRejected still recognizes rows written without its flag.
+	// The replay catalog seeds only provider/model requests, without rebuilding
+	// aliases or groups, so unresolved names miss model-scoped limits.
+	// A bare model name can still resolve if another record seeded that model.
 	return r.Requested
 }
 
@@ -444,6 +449,9 @@ func TestBudgetReplayUnpriced(t *testing.T) {
 			}
 			replayHome(t, records)
 			results := replay(t, records, limits, hold)
+			if got := results["key-a"].refused; got != 2 {
+				t.Errorf("key-a: refused=%d want 2", got)
+			}
 			for id, want := range map[string]int{"key-a": 2, "key-b": 0, "key-c": 1} {
 				if got := results[id].unpriced; got != want {
 					t.Errorf("key %s: unpriced=%d want %d", id, got, want)
