@@ -34,7 +34,9 @@
 //     goes on to the models outside it, as the gateway leaves a spent
 //     limit's models out of every route's candidates (Spent). A group's
 //     request holds no reservation in a model's limit, so parallel
-//     requests through groups can go over it by about one call each.
+//     requests through groups can go over it by about one call each when
+//     HoldReservations is enabled; with it off (the fork's default),
+//     all requests are checked against settled usage only.
 //   - Only requests that came with a gateway key are limited: from
 //     another computer one is required; on this one a request without one
 //     (or with a token that is no key) isn't limited.

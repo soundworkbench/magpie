@@ -18,6 +18,7 @@ import (
 
 type replayResult struct {
 	allowed, refused, falseRefusals int
+	unpriced                        int
 	windows                         map[string]*replayWindow
 }
 
@@ -81,15 +82,32 @@ func replayHome(t *testing.T, records []usage.Record) {
 	// contacting any provider. Costing still uses the normal ledger prices.
 	models := map[string][]string{}
 	for _, r := range records {
-		if r.Provider != "" && r.Model != "" && !slices.Contains(models[r.Provider], r.Model) {
-			models[r.Provider] = append(models[r.Provider], r.Model)
+		if pid, model, ok := strings.Cut(replayModel(r), "/"); ok && pid != "" && model != "" && !slices.Contains(models[pid], model) {
+			models[pid] = append(models[pid], model)
 		}
 	}
-	for id, ms := range models {
-		if err := provider.Save(provider.Provider{ID: id, Name: id, Key: "replay", Chat: "http://127.0.0.1:1/v1", Models: ms}); err != nil {
-			t.Fatal(err)
-		}
+	// Seed only the temporary catalog, including reserved subscription ids.
+	// Save validates new user providers, which these historical ids are not.
+	var ps []provider.Provider
+	for _, id := range sortedReplayKeys(models) {
+		ps = append(ps, provider.Provider{ID: id, Name: id, Key: "replay", Chat: "http://127.0.0.1:1/v1", Models: models[id]})
 	}
+	b, err := json.Marshal(map[string]any{"providers": ps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(provider.Path(), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replayModel(r usage.Record) string {
+	if r.Provider != "" && r.Model != "" {
+		return r.Provider + "/" + r.Model
+	}
+	// Local rejections name only the requested model. Keep the record itself
+	// unchanged so IsRejected still recognizes rows written without its flag.
+	return r.Requested
 }
 
 // replay admits only starts that Reserve allows. Only admitted requests
@@ -198,7 +216,7 @@ func replay(t *testing.T, records []usage.Record, limits map[string][]access.Lim
 		if issuer, ok := identities[r.CallerIssuerID]; ok {
 			who.Issuer = &issuer
 		}
-		model := r.Provider + "/" + r.Model
+		model := replayModel(r)
 		// Check actual sums independently of held, across every applicable cap;
 		// a different, later-reset reservation refusal mustn't hide a spent cap.
 		actuallySpent := false
@@ -206,17 +224,25 @@ func replay(t *testing.T, records []usage.Record, limits map[string][]access.Lim
 		if who.Issuer != nil {
 			ids = append(ids, *who.Issuer)
 		}
+		_, priced := costOf(r)
 		for _, id := range ids {
+			unpriced := false
 			for n, l := range limits[id.KeyID] {
 				if l.Scoped() && !scopeHas(&l, servedAs(model)) {
 					continue
 				}
+				unpriced = unpriced || l.Cost > 0 && !priced
 				start, _ := l.Window(e.at)
 				w := results[id.KeyID].windows[fmt.Sprintf("%d/%s", n, start.Format(time.RFC3339Nano))]
 				if w == nil {
 					continue
 				}
 				actuallySpent = actuallySpent || l.Tokens > 0 && w.sums.tokens(&l) >= l.Tokens || l.Cost > 0 && w.sums.cost >= l.Cost
+			}
+			// Count each input row once per key, even if refused or covered by
+			// several cost caps. Settlement alone misses refused rows.
+			if unpriced {
+				results[id.KeyID].unpriced++
 			}
 		}
 		release, refused := Reserve(who, int64(r.PlainBytes), model, e.at)
@@ -248,7 +274,7 @@ func replay(t *testing.T, records []usage.Record, limits map[string][]access.Lim
 			}
 			excess = append(excess, fmt.Sprintf("%s..%s limit=%s/%s excess_tokens=%d excess_cost=$%.6f unpriced=%d", w.start.Format(time.RFC3339), w.reset.Format(time.RFC3339), w.limit.Period, w.limit.Scope(), tokens, cost, w.sums.unpriced))
 		}
-		t.Logf("hold=%t key=%s allowed=%d refused=%d false_refusals=%d windows=[%s]", hold, id, r.allowed, r.refused, r.falseRefusals, strings.Join(excess, "; "))
+		t.Logf("hold=%t key=%s allowed=%d refused=%d false_refusals=%d unpriced=%d windows=[%s]", hold, id, r.allowed, r.refused, r.falseRefusals, r.unpriced, strings.Join(excess, "; "))
 		if !hold && r.falseRefusals != 0 {
 			t.Errorf("key %s: %d false refusals", id, r.falseRefusals)
 		}
@@ -278,7 +304,15 @@ func TestBudgetReplay(t *testing.T) {
 	}
 	records, limits := readReplay(t, logPath, limitsPath)
 	for _, hold := range []bool{false, true} {
-		t.Run(fmt.Sprint(hold), func(t *testing.T) { replayHome(t, records); replay(t, records, limits, hold) })
+		t.Run(fmt.Sprint(hold), func(t *testing.T) {
+			replayHome(t, records)
+			results := replay(t, records, limits, hold)
+			for _, id := range sortedReplayKeys(results) {
+				if n := results[id].unpriced; n > 0 {
+					t.Errorf("key %s: %d records with unknown cost in cost-limited scopes", id, n)
+				}
+			}
+		})
 	}
 }
 
@@ -296,6 +330,11 @@ func TestBudgetReplaySample(t *testing.T) {
 				t.Fatal(err)
 			}
 			results := replay(t, records, limits, hold)
+			for id, r := range results {
+				if r.unpriced != 0 {
+					t.Errorf("key %s: unpriced=%d want 0", id, r.unpriced)
+				}
+			}
 			want := [3]int{4, 1, 0}
 			if hold {
 				want = [3]int{2, 3, 3}
@@ -336,6 +375,22 @@ func TestBudgetReplaySample(t *testing.T) {
 					t.Fatalf("window %s: %d tokens want %d", w.start, got, wantTokens)
 				}
 			}
+			c := results["key-c"]
+			if got := [3]int{c.allowed, c.refused, c.falseRefusals}; got != [3]int{2, 2, 0} {
+				t.Fatalf("key-c: %v want [2 2 0]", got)
+			}
+			if len(c.windows) != 1 {
+				t.Fatalf("subscription windows: %d want 1", len(c.windows))
+			}
+			for _, w := range c.windows {
+				if w.sums.cost != 12 {
+					t.Fatalf("recorded cost %v want 12", w.sums.cost)
+				}
+			}
+			d := results["key-d"]
+			if got := [3]int{d.allowed, d.refused, d.falseRefusals}; got != [3]int{1, 1, 0} {
+				t.Fatalf("key-d: %v want [1 1 0]", got)
+			}
 		})
 	}
 }
@@ -363,6 +418,36 @@ func TestBudgetReplayInputs(t *testing.T) {
 			got := replay(t, records, map[string][]access.Limit{"key-a": {{Period: "day", Tokens: 1000}}}, true)["key-a"]
 			if got.allowed != 1 || got.refused != 0 || got.falseRefusals != 0 {
 				t.Fatalf("non-request acquired a reservation: %+v", got)
+			}
+		})
+	}
+}
+
+func TestBudgetReplayUnpriced(t *testing.T) {
+	for _, hold := range []bool{false, true} {
+		t.Run(fmt.Sprint(hold), func(t *testing.T) {
+			at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+			one, zero := 1.0, 0.0
+			records := []usage.Record{
+				{Time: at, CallerKeyID: "key-a", Provider: "plan", Model: "unlisted-model", Input: 100, Status: 200},
+				{Time: at.Add(time.Second), CallerKeyID: "key-a", Provider: "plan", Model: "unlisted-model", Input: 100, OwnCost: &one, Status: 200},
+				// This unpriced call is refused, but still makes the input incomplete.
+				{Time: at.Add(2 * time.Second), CallerKeyID: "key-a", CallerIssuerID: "key-c", Provider: "plan", Model: "unlisted-model", Input: 100, Status: 200},
+				{Time: at.Add(3 * time.Second), CallerKeyID: "key-a", Provider: "outside", Model: "unlisted-model", Input: 100, Status: 200},
+				{Time: at.Add(4 * time.Second), CallerKeyID: "key-a", Provider: "plan", Model: "unlisted-model", Input: 100, OwnCost: &zero, Status: 200},
+				{Time: at, CallerKeyID: "key-b", Provider: "plan", Model: "unlisted-model", Input: 100, Status: 200},
+			}
+			limits := map[string][]access.Limit{
+				"key-a": {{Period: "day", Cost: 1, Models: []string{"plan/*"}}, {Period: "month", Cost: 10, Models: []string{"plan/*"}}},
+				"key-b": {{Period: "day", Tokens: 1000}},
+				"key-c": {{Period: "day", Cost: 1, Models: []string{"plan/*"}}},
+			}
+			replayHome(t, records)
+			results := replay(t, records, limits, hold)
+			for id, want := range map[string]int{"key-a": 2, "key-b": 0, "key-c": 1} {
+				if got := results[id].unpriced; got != want {
+					t.Errorf("key %s: unpriced=%d want %d", id, got, want)
+				}
 			}
 		})
 	}

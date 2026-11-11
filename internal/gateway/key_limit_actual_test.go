@@ -222,6 +222,10 @@ func TestKeyLimitActualOnlyReleases(t *testing.T) {
 			if end == "stream" && st.Tokens != 350 {
 				t.Fatalf("stream not settled: %+v", st)
 			}
+			// The client disconnects before the upstream sends its usage frame.
+			if end == "disconnect" && (st.Tokens != 0 || st.Cost != 0) {
+				t.Fatalf("disconnect settled unreported usage: %+v", st)
+			}
 		})
 	}
 }

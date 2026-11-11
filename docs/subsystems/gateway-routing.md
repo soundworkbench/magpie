@@ -745,8 +745,13 @@ add no usage. Equal-time completions precede new starts, and zero-duration
 calls settle immediately. The report lists admissions, refusals, refusals
 below every applicable actual cap, and each original window's final excess
 (including late completions). Reported, probe/tool/search and remote-computer
-rows are excluded. Pricing uses the normal ledger coster; `unpriced` counts
-calls with unknown prices, which add no cost. The isolated test environment
+rows are excluded. Pricing uses the normal ledger coster, including recorded
+`cost` values. Each key's `unpriced` counts input rows with unknown cost in
+any of its cost-limited model scopes, including refused rows, once per key;
+any nonzero count fails `TestBudgetReplay`. Window counts cover settled rows.
+The temporary provider catalog includes recorded subscription ids, and a
+row missing provider/model uses `req` for admission without changing its
+rejection status. The isolated test environment
 does not import live custom prices, provider rate windows or model aliases.
 `TestBudgetReplaySample` supplies synthetic prices and tests both modes,
 including overlapping calls and a late completion across midnight.

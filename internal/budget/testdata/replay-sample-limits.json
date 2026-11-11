@@ -1,4 +1,6 @@
 {
   "key-a": [{"period":"day","cost":30}],
-  "key-b": [{"period":"day","tokens":1000}]
+  "key-b": [{"period":"day","tokens":1000}],
+  "key-c": [{"period":"day","cost":10,"models":["claude/*"]}],
+  "key-d": [{"period":"day","cost":10,"models":["codex/*"]}]
 }
