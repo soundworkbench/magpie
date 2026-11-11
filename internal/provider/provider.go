@@ -2350,8 +2350,8 @@ func (p Provider) Ready() bool {
 // magpie that is this magpie (SelfLeftOut).
 func (p Provider) On() bool { return p.Ready() && !p.switchedOff() }
 
-// switchedOff identifies providers whose requests get a specific refusal,
-// even when they are not ready.
+// switchedOff identifies the three states SwitchedOff refuses by name:
+// switched off, kept to the agent's own sign-in, or left out as this magpie itself.
 func (p Provider) switchedOff() bool { return p.Off || p.KeptToAgent() || p.SelfLeftOut() }
 
 // KeptToAgent is whether the provider is Claude's subscription with

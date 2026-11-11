@@ -1019,8 +1019,8 @@ func GroupFor(id string) (string, bool) {
 // PrefixedGroupFor finds a group behind a client's vendor prefix when
 // that prefix names no provider, or one that is only not ready. Enabled
 // providers and those refused by SwitchedOff keep their resolution, as
-// do exact catalog ids. The gateway must still check the
-// key's access to the group and keep the original id when it is not allowed.
+// do exact catalog ids. The gateway must still check the key's access to
+// the group and keep the original id when it is not allowed.
 func PrefixedGroupFor(id string) (string, bool) {
 	id = strings.TrimSuffix(strings.TrimSpace(id), "[1m]")
 	pid, model, ok := strings.Cut(id, "/")

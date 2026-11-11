@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/catalog"
@@ -21,6 +24,8 @@ func TestPrefixedModelGroup(t *testing.T) {
 	for _, tc := range []struct {
 		name, asked, channel, alias, mapped, model, path string
 		off, group                                       bool
+		unready, kept, self                              bool
+		refusal                                          string
 		models                                           []string
 		status                                           int
 		served                                           string
@@ -35,6 +40,11 @@ func TestPrefixedModelGroup(t *testing.T) {
 		{name: "bare name", asked: opus, group: true},
 		{name: "disabled channel", asked: "vendor/" + opus, channel: "vendor", off: true, status: http.StatusNotFound},
 		{name: "disabled alias", asked: "old/" + opus, channel: "renamed", alias: "old", off: true, status: http.StatusNotFound},
+		{name: "unready channel", asked: "unready/" + opus, unready: true, models: []string{"group/claude-*"}, group: true},
+		{name: "kept subscription", asked: "Claude/" + opus, kept: true, status: http.StatusNotFound, refusal: "kept to Claude Code's own sign-in"},
+		// ThroughSelf strips this prefix, but the members list only "claude/" + opus,
+		// so the bare model cannot resolve and the self-specific refusal remains.
+		{name: "self remote", asked: "remote-self/" + opus, channel: "remote-self", self: true, status: http.StatusNotFound, refusal: "a Remote magpie that is this magpie itself"},
 		{name: "enabled channel", asked: "vendor/" + opus, channel: "vendor", served: "vendor"},
 		{name: "enabled alias", asked: "old/" + opus, channel: "renamed", alias: "old", served: "renamed"},
 		{name: "channel name", asked: "VENDOR/" + opus, channel: "vendor", served: "vendor"},
@@ -54,6 +64,59 @@ func TestPrefixedModelGroup(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fresh(t)
+			writeJSON := func(path string, v any) {
+				t.Helper()
+				b, err := json.Marshal(v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, b, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.unready {
+				// Save requires a key here. A loopback URL would make the key optional.
+				writeJSON(provider.Path(), map[string]any{"providers": []provider.Provider{
+					{ID: "unready", Name: "Unready", Chat: "https://relay.example.com/v1"},
+				}})
+				p, err := provider.Find("unready")
+				if err != nil || p.Ready() || p.On() || p.Off || p.Key != "" {
+					t.Fatal("expected an existing keyless provider that is unready, not switched off")
+				}
+			}
+			if tc.kept {
+				t.Cleanup(provider.ForgetAccounts)
+				// Account discovery relies on the claude stand-in installed by TestMain.
+				config := t.TempDir()
+				t.Setenv("CLAUDE_CONFIG_DIR", config)
+				writeJSON(filepath.Join(config, ".credentials.json"), map[string]any{
+					"claudeAiOauth": map[string]any{
+						"accessToken": "test-access-token", "refreshToken": "test-refresh-token",
+						"expiresAt": time.Now().Add(time.Hour).UnixMilli(), "subscriptionType": "max",
+						"scopes": []string{"user:inference", "user:profile"},
+					},
+				})
+				provider.ForgetAccounts()
+				if err := provider.SetSwitchOnly("claude", true); err != nil {
+					t.Fatal(err)
+				}
+				p, err := provider.Find("claude")
+				if err != nil || !p.KeptToAgent() || p.On() || p.Off {
+					t.Fatal("expected a subscription kept to its agent without being switched off")
+				}
+			}
+			if tc.self {
+				was := provider.LeaveOutSelf
+				provider.LeaveOutSelf = true
+				t.Cleanup(func() { provider.LeaveOutSelf = was })
+				// Seed the discovery record before the provider catalog reads it.
+				writeJSON(filepath.Join(filepath.Dir(provider.Path()), "remote-self.json"), map[string]string{
+					tc.channel: "http://127.0.0.1:1/" + tc.channel + "/v1",
+				})
+			}
 			if err := provider.SetAutoGroups(false); err != nil {
 				t.Fatal(err)
 			}
@@ -87,10 +150,19 @@ func TestPrefixedModelGroup(t *testing.T) {
 			}
 			if tc.channel != "" {
 				p := provider.Provider{ID: tc.channel, Off: tc.off, Models: []string{model, "wire-model"}}
+				if tc.self {
+					p.Preset = provider.RemoteMagpiePreset
+				}
 				if tc.alias != "" {
 					p.Was = []string{tc.alias}
 				}
 				save(p)
+				if tc.self {
+					p, err := provider.Find(tc.channel)
+					if err != nil || !p.SelfLeftOut() || p.On() || p.Off {
+						t.Fatal("expected a remote left out as this magpie without being switched off")
+					}
+				}
 			}
 			if tc.mapped != "" {
 				ref := tc.channel + "/wire-model"
@@ -148,6 +220,14 @@ func TestPrefixedModelGroup(t *testing.T) {
 				}
 				if got := requests.Load(); got != 0 {
 					t.Fatalf("sent %d upstream requests for a switched-off provider, want none", got)
+				}
+			}
+			if tc.refusal != "" {
+				if !strings.Contains(w.Body.String(), tc.refusal) {
+					t.Fatalf("missing refusal %q: %s", tc.refusal, w.Body)
+				}
+				if got := requests.Load(); got != 0 {
+					t.Fatalf("sent %d upstream requests for an unavailable provider, want none", got)
 				}
 			}
 			if tc.models != nil && status != 404 {
