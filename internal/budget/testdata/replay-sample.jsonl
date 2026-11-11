@@ -1,0 +1,10 @@
+{"t":"2026-09-30T12:00:00Z","ms":0,"callerKeyId":"key-a","provider":"plan","model":"m1","in":18000,"out":0,"status":200}
+{"t":"2026-09-30T12:00:01Z","ms":10000,"callerKeyId":"key-a","provider":"plan","model":"m1","in":6000,"out":0,"plain_bytes":2097152,"status":200}
+{"t":"2026-09-30T12:00:02Z","ms":1000,"callerKeyId":"key-a","provider":"plan","model":"m1","in":6000,"out":0,"plain_bytes":819200,"status":200}
+{"t":"2026-09-30T12:00:04Z","ms":1000,"callerKeyId":"key-a","provider":"plan","model":"m1","in":6000,"out":0,"plain_bytes":819200,"status":200}
+{"t":"2026-09-30T12:00:06Z","ms":0,"callerKeyId":"key-a","provider":"plan","model":"m1","in":6000,"status":200}
+{"t":"2026-09-30T23:59:59Z","ms":2000,"callerKeyId":"key-b","provider":"plan","model":"m1","in":600,"plain_bytes":8000,"status":200}
+{"t":"2026-10-01T00:00:00Z","ms":0,"callerKeyId":"key-b","provider":"plan","model":"m1","in":100,"status":200}
+{"t":"2026-10-01T00:00:00.500Z","ms":1000,"callerKeyId":"key-b","provider":"plan","model":"m1","in":600,"cache_read":5000,"plain_bytes":8000,"status":200}
+{"t":"2026-10-01T00:00:00.600Z","ms":0,"callerKeyId":"key-b","provider":"plan","model":"m1","cache_write":400,"status":400}
+{"t":"2026-10-01T00:00:02Z","ms":0,"callerKeyId":"key-b","provider":"plan","model":"m1","in":1,"status":200}
