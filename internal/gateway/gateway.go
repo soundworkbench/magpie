@@ -1832,7 +1832,10 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	model, _ = askedAt(model) // counted as the model, whatever its effort
 	id := unprefixed(model)
-	if sid, ok := provider.AutoStandIn(id); ok {
+	// Resolve and every count guard use the same group as generation.
+	if gid, ok := keyGroupFor(r, id); ok {
+		id = gid
+	} else if sid, ok := provider.AutoStandIn(id); ok {
 		id = sid
 	}
 	pick := desktopSubagentPick(r, agentOf(r), named, id, body)
@@ -1850,6 +1853,9 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	r = heldByGroupAt(r, id)
 	// nor on one the user disabled (#1867)
 	if countOff(w, provider.Anthropic, id) {
+		return
+	}
+	if countPrefixedOff(w, provider.Anthropic, id) {
 		return
 	}
 	// nor on a decision model or a group of them, which hold no
@@ -2148,12 +2154,20 @@ func (s *Server) gemini(w http.ResponseWriter, r *http.Request) {
 	case "streamGenerateContent":
 		stream = true
 	case "countTokens":
+		if gid, ok := keyGroupFor(r, model); ok {
+			model = gid
+		} else if sid, ok := provider.AutoStandIn(model); ok {
+			model = sid
+		}
 		// a gateway key held to some models (#882) counts no tokens on one
 		// it may not use, as it would be refused serving it
 		if countHeld(w, r, provider.Gemini, model) {
 			return
 		}
 		if countOff(w, provider.Gemini, model) { // nor a disabled one (#1867)
+			return
+		}
+		if countPrefixedOff(w, provider.Gemini, model) {
 			return
 		}
 		s.geminiCount(w, model, body)

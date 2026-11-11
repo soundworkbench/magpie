@@ -2451,9 +2451,13 @@ resolution and its specific error instead of routing to a group: it is
 switched off, kept to its agent's own sign-in, or a Remote magpie pointing
 back to this magpie and left out. `keyGroupFor` in
 [`key_models.go`](../../internal/gateway/key_models.go) applies this to
-requests and token-count permissions only when the key may use that
-group. Otherwise the original id keeps its existing resolution and
-permissions. Ids of enabled providers or providers refused by `SwitchedOff`,
+requests only when the key may use that group. Otherwise the original id
+keeps its existing resolution and permissions. Anthropic's `count_tokens`
+and Gemini's `:countTokens` select that same group before resolution and
+count guards; a refused provider prefix gets the same 404 as Messages.
+Anthropic's `count_tokens` also counts through the group when an unprefixed
+name matches a routing group, just as Messages does.
+Ids of enabled providers or providers refused by `SwitchedOff`,
 exact mapped catalog ids and names with no matching group keep their
 resolution. Group requests appear under the
 group in routing logs and under the serving member in usage, as a bare
