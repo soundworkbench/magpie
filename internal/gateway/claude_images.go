@@ -21,7 +21,6 @@ import (
 	"sync"
 
 	_ "golang.org/x/image/bmp"
-	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 )
 
@@ -45,21 +44,22 @@ import (
 // the image: scaled to fit 2000 px a side, a JPEG written again as JPEG at
 // quality 85 and any other as PNG, then as JPEG at a lower quality if that
 // is still over the base64 limit. An image that fits goes as it came, byte
-// for byte. An unsupported readable image goes as PNG, an incomplete or
-// unreadable one as a note. Complete supported containers Go cannot decode
-// go to Anthropic unchanged, with their real type.
+// for byte. A BMP within the conversion limit goes as PNG, a TIFF or an
+// incomplete or unreadable image as a note. Complete supported containers
+// Go cannot decode go to Anthropic unchanged, with their real type.
 const (
 	claudeImageSide   = 2000
 	claudeImageBase64 = 5 << 20
 )
 
-// At 3840*2160 pixels, the worst TIFF holds 8 bytes per pixel of image
-// plus up to 2*8 bytes per pixel of strip buffer: about 200 MiB, within
-// the 320 MiB decode budget.
+// A BMP decoder holds at most 4 bytes a pixel; refitting adds a 4-byte
+// RGBA copy and a 16-byte row buffer per target-width * source-height
+// cell. The target width never exceeds the source's: at 3840*2160 pixels,
+// 24 bytes a pixel is about 190 MiB, within the 320 MiB decode budget.
 const claudeImageConvertPixels = 3840 * 2160
 
-// These costly decoders are fed by clients; only one conversion may run
-// at a time, including the refit that still holds the decoded image.
+// This file registers the BMP decoder that clients feed, so its conversions
+// run one at a time, including the refit that still holds the decoded image.
 var claudeImageConvertMu sync.Mutex
 
 // claudeImageLimits keys the images claudeImage made in fitted, apart
@@ -142,7 +142,9 @@ func claudeImageReadRecord(declared, data string) claudeImageRecord {
 	rd := bufio.NewReader(io.TeeReader(base64.NewDecoder(base64.StdEncoding, strings.NewReader(data)), io.MultiWriter(hash, count)))
 	head, _ := rd.Peek(12)
 	record := claudeImageRecord{declared: strings.Clone(declared[:min(len(declared), 64)]), found: claudeImageType(head)}
-	if cfg, format, err := image.DecodeConfig(io.LimitReader(rd, 1<<20)); err == nil {
+	if claudeImageTIFF(head) {
+		record.found = "image/tiff"
+	} else if cfg, format, err := image.DecodeConfig(io.LimitReader(rd, 1<<20)); err == nil {
 		record.width, record.height = cfg.Width, cfg.Height
 		if record.found == "" {
 			record.found = "image/" + format
@@ -158,6 +160,12 @@ type claudeImageCounter struct{ n int }
 func (c *claudeImageCounter) Write(b []byte) (int, error) {
 	c.n += len(b)
 	return len(b), nil
+}
+
+// TIFF is not decoded: its decoder's buffers follow tile and strip sizes
+// the file chooses, rather than its image dimensions.
+func claudeImageTIFF(raw []byte) bool {
+	return bytes.HasPrefix(raw, []byte("II*\x00")) || bytes.HasPrefix(raw, []byte("MM\x00*"))
 }
 
 // claudeImageType reads only the magic number, never the client's label.
@@ -308,8 +316,15 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEnt
 	}
 	raw, err := base64.StdEncoding.DecodeString(data)
 	sum := sha256.Sum256(raw)
-	cfg, format, headerErr := image.DecodeConfig(bytes.NewReader(raw))
 	record.found, record.bytes, record.hash = claudeImageType(raw), len(raw), fmt.Sprintf("%x", sum[:4])
+	if claudeImageTIFF(raw) {
+		record.found, mt = "image/tiff", "image/tiff"
+		if err != nil {
+			return omit("invalid base64", len(raw))
+		}
+		return omit("TIFF is not converted", len(raw))
+	}
+	cfg, format, headerErr := image.DecodeConfig(bytes.NewReader(raw))
 	if headerErr == nil {
 		record.width, record.height = cfg.Width, cfg.Height
 	}
@@ -331,7 +346,7 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEnt
 		}
 		return omit("unreadable image header", len(raw))
 	}
-	if mt == "" && cfg.Width > 0 && cfg.Height > 0 && (cfg.Width > claudeImageConvertPixels || cfg.Height > claudeImageConvertPixels/cfg.Width) {
+	if format == "bmp" && cfg.Width > 0 && cfg.Height > 0 && (cfg.Width > claudeImageConvertPixels || cfg.Height > claudeImageConvertPixels/cfg.Width) {
 		return omit("image too large to convert", len(raw))
 	}
 	holds, ok := imageHolds(cfg, format)
@@ -341,7 +356,7 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEnt
 		}
 		return omit("image exceeds the decode limit", len(raw))
 	}
-	if mt == "" {
+	if format == "bmp" {
 		claudeImageConvertMu.Lock()
 		defer claudeImageConvertMu.Unlock()
 	}

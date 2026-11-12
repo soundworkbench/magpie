@@ -186,7 +186,7 @@ func TestClaudeImageBrokenOrUnreadable(t *testing.T) {
 }
 
 func TestClaudeImageOtherFormatsAsPNG(t *testing.T) {
-	for _, format := range []string{"bmp", "tiff"} {
+	for _, format := range []string{"bmp"} {
 		t.Run(format, func(t *testing.T) {
 			raw := replayImage(t, format)
 			original, _, err := image.Decode(bytes.NewReader(raw))
