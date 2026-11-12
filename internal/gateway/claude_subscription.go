@@ -3811,6 +3811,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	// closed empty when the run ended, and a reply asked for whole went
 	// as a 200 with no content and no usage, which the client took for
 	// the answer (steven_4422, 18 images to claude-sonnet-5-5).
+	mediaRemoved := ""   // Anthropic refused an image; Claude Code may ask again
 	begun := false       // a message began since the turn's last result
 	aside := ""          // what Claude Code said in its own words this turn
 	retell := false      // the run is told to make its calls once this turn's result is in
@@ -3860,6 +3861,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		}
 		unstreamed = ""
 		end(unstreamedStop)
+		if mediaRemoved != "" && unstreamedStop == "" {
+			return // the turn's result must say whether the retry answered
+		}
 		if !inside {
 			r.endSegment()
 		}
@@ -4020,18 +4024,34 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		}
 		return nil
 	}
+	mediaFailure := func() {
+		if quiet != nil {
+			quiet.Stop()
+		}
+		unstreamed = ""
+		cut = false
+		r.emit(Event{Kind: KError, Text: mediaRemoved, Status: http.StatusBadRequest,
+			Code: "media_removed", RequestID: reqID,
+			Said: json.RawMessage(`{"error":{"type":"invalid_request_error"}}`)})
+		r.endSegment()
+	}
 	// failed ends the reply with an error where it was cut short with
 	// nothing to go on in
 	failed := func(why string) {
+		if mediaRemoved != "" {
+			mediaFailure()
+			return
+		}
 		cut = false
 		r.emit(Event{Kind: KError, Text: "Claude Code's stream from Anthropic was cut short " + why, Status: http.StatusBadGateway, RequestID: reqID})
 		r.endSegment()
 	}
 	line := func(b []byte) {
 		var envelope struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
-			IsError bool   `json:"is_error"`
+			Type       string `json:"type"`
+			Subtype    string `json:"subtype"`
+			IsError    bool   `json:"is_error"`
+			IsAPIError bool   `json:"is_api_error"`
 			// Claude Code's session, on its init message
 			SessionID string `json:"session_id"`
 			Result    string `json:"result"`
@@ -4043,6 +4063,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			// and on a failure the HTTP status Claude Code got and its
 			// name for the kind of error (rate_limit, server_error…)
 			RequestID      string          `json:"request_id"`
+			APIError       string          `json:"api_error"`
 			APIErrorStatus int             `json:"api_error_status"`
 			ErrorKind      json.RawMessage `json:"error"`
 			// what Claude Code's WebSearch found, on the message that
@@ -4092,6 +4113,26 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		if json.Unmarshal(b, &envelope) != nil {
 			return
 		}
+		if envelope.Type == "result" && (envelope.APIError == "media_removed" ||
+			envelope.IsError && strings.Contains(strings.ToLower(envelope.Result), claudetui.MediaRemovedSentence)) {
+			if envelope.APIError != "media_removed" && mediaRemoved == "" {
+				log.Printf("claude: media_removed: media=%q reason=%q continues=false message_bytes=%d", "image", "unprocessable", len(envelope.Result))
+			}
+			mediaRemoved = envelope.Result
+			if envelope.APIError != "media_removed" || mediaRemoved == "" {
+				mediaRemoved = claudetui.MediaRemovedMessage("")
+			}
+			mediaFailure()
+			mediaRemoved, begun, aside = "", false, ""
+			return
+		}
+		if envelope.Type == "media_removed" {
+			mediaRemoved = envelope.Result
+			if mediaRemoved == "" {
+				mediaRemoved = claudetui.MediaRemovedMessage("")
+			}
+			return
+		}
 		var whole struct {
 			ID               string          `json:"id"`
 			Model            string          `json:"model"`
@@ -4111,6 +4152,21 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		}
 		if envelope.Type == "assistant" {
 			_ = json.Unmarshal(envelope.Message, &whole)
+			if whole.Model == "<synthetic>" {
+				for _, c := range whole.Content {
+					if c.Type == "text" && strings.Contains(strings.ToLower(c.Text), claudetui.MediaRemovedSentence) {
+						if mediaRemoved == "" {
+							log.Printf("claude: media_removed: media=%q reason=%q continues=false message_bytes=%d", "image", "unprocessable", len(c.Text))
+						}
+						mediaRemoved = claudetui.MediaRemovedMessage("")
+						mediaFailure()
+						return
+					}
+				}
+				if envelope.IsAPIError || len(envelope.ErrorKind) > 0 {
+					mediaRemoved = "" // a later ordinary API failure keeps its own handling
+				}
+			}
 			var ids []string
 			for _, c := range whole.Content {
 				if c.Type == "tool_use" && strings.HasPrefix(c.Name, "mcp__magpie__") && c.ID != "" {
@@ -4189,6 +4245,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			}
 		}
 		if envelope.Type == "result" {
+			defer func() { mediaRemoved = "" }()
 			retell, answerAsked = false, false
 			silent, said := !begun, aside
 			begun, aside = false, ""
@@ -4224,6 +4281,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				}
 				r.emit(Event{Kind: KError, Text: text, Status: envelope.APIErrorStatus, Code: errKind, RequestID: reqID})
 				r.endSegment()
+			case mediaRemoved != "" && r.waitingOnReply() &&
+				(silent || cut || !waiting && r.replyUnended() || waiting && (len(envelope.StructuredOutput) == 0 || string(envelope.StructuredOutput) == "null")):
+				mediaFailure()
 			case cut:
 				failed("and Claude Code ended the turn without asking again")
 			case waiting && len(envelope.StructuredOutput) > 0 && string(envelope.StructuredOutput) != "null":
@@ -4441,7 +4501,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	defer pmu.Unlock()
 	over = true
 	settle()
-	if err := s.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
+	if mediaRemoved != "" && r.waitingOnReply() {
+		mediaFailure()
+	} else if err := s.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
 		r.emit(Event{Kind: KError, Text: err.Error()})
 	} else if cut {
 		failed("and Claude Code stopped")
@@ -5230,8 +5292,11 @@ func imageBlocks(blocks []map[string]any, text *strings.Builder, p Part) []map[s
 		text.Reset()
 	}
 	switch {
-	case p.Data != "":
-		mediaType, data := claudeImage(p.MediaType, p.Data)
+	case p.Data != "" || p.URL == "":
+		mediaType, data, note := claudeImage(p.MediaType, p.Data)
+		if note != "" {
+			return append(blocks, map[string]any{"type": "text", "text": note})
+		}
 		blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": mediaType, "data": data}})
 	case p.URL != "":
 		blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": p.URL}})
@@ -5856,8 +5921,12 @@ func mcpResult(p Part) mcpToolResult {
 	content := []map[string]any{{"type": "text", "text": p.Text}}
 	for _, im := range p.Images {
 		switch {
-		case im.Data != "":
-			mimeType, data := claudeImage(imageMediaType(im), im.Data)
+		case im.Data != "" || im.URL == "":
+			mimeType, data, note := claudeImage(im.MediaType, im.Data)
+			if note != "" {
+				content = append(content, map[string]any{"type": "text", "text": note})
+				continue
+			}
 			content = append(content, map[string]any{"type": "image", "data": data, "mimeType": mimeType})
 		case im.URL != "":
 			content = append(content, map[string]any{"type": "text", "text": "[image: " + im.URL + "]"})
@@ -5866,15 +5935,11 @@ func mcpResult(p Part) mcpToolResult {
 	return mcpToolResult{Content: content, IsError: p.IsError}
 }
 
-// imageMediaType is an inline image's type, read from its bytes when the
-// client did not say.
+// imageMediaType is an inline image's type, read from its bytes.
 func imageMediaType(p Part) string {
-	if p.MediaType != "" {
-		return p.MediaType
-	}
 	head := p.Data[:min(len(p.Data), 64)]
 	b, _ := base64.StdEncoding.DecodeString(head[:len(head)/4*4])
-	return http.DetectContentType(b)
+	return claudeImageType(b)
 }
 
 func callIDs(parts []Part) string {
@@ -7257,6 +7322,9 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 				usage.add(Usage{ErrType: head[n-1].Code, RequestID: head[n-1].RequestID})
 				msg = thirdPartyRefused(name, req, code, msg)
 			}
+			if n > 0 && head[n-1].Code == "media_removed" {
+				return writeError(w, from, code, msg), msg
+			}
 			return writeError(w, from, code, name+": "+msg), msg
 		}
 		if begin != nil {
@@ -7274,6 +7342,9 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 				return
 			case KError:
 				failed = ev.Text
+				if ev.Code == "media_removed" {
+					noteSaidStatus(w, ev.Status)
+				}
 			case KStart, KUsage:
 				usage.add(ev.Usage)
 				usage.add(Usage{Served: ev.Model, RequestID: ev.RequestID})
@@ -7343,6 +7414,9 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 		}
 		usage.add(Usage{ErrType: col.errCode})
 		msg = thirdPartyRefused(name, req, code, msg)
+		if col.errCode == "media_removed" {
+			return writeError(w, from, code, msg), msg
+		}
 		return writeError(w, from, code, name+": "+msg), msg
 	}
 	ended(said, stop, col.err == "" && r.Context().Err() == nil)

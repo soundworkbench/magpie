@@ -3,16 +3,20 @@ package gateway
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"image"
 	"image/color"
 	"image/draw"
-	"image/gif"
+	_ "image/gif"
 	"image/jpeg"
 	"image/png"
+	"log"
 	"math"
-	"strings"
+	"strconv"
 
-	"golang.org/x/image/webp"
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 )
 
 // Claude Code fits an image it reads from a file before it sends one
@@ -35,7 +39,9 @@ import (
 // the image: scaled to fit 2000 px a side, a JPEG written again as JPEG at
 // quality 85 and any other as PNG, then as JPEG at a lower quality if that
 // is still over the base64 limit. An image that fits goes as it came, byte
-// for byte, and so does one that can't be read.
+// for byte. An unsupported readable image goes as PNG, an incomplete or
+// unreadable one as a note. Complete supported containers Go cannot decode
+// go to Anthropic unchanged, with their real type.
 const (
 	claudeImageSide   = 2000
 	claudeImageBase64 = 5 << 20
@@ -45,62 +51,219 @@ const (
 // from Codex's.
 var claudeImageLimits = imageLimits{side: claudeImageSide, patches: -1}
 
-// claudeImage is the media type and base64 an inline image is sent to
-// Claude Code with.
-func claudeImage(mediaType, data string) (string, string) {
-	if data == "" || len(data) > codexImageMaxBytes {
-		return mediaType, data
-	}
-	cfg, _, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(data)))
-	if err != nil {
-		return mediaType, data
-	}
-	if cfg.Width <= claudeImageSide && cfg.Height <= claudeImageSide && len(data) <= claudeImageBase64 {
-		return mediaType, data
-	}
-	key := fitKey(mediaType+";"+data, claudeImageLimits)
+const claudeImageOmitted = "[An image was left out: the gateway could not read it]"
+
+// claudeImage is the real media type and base64 sent to Claude Code, or
+// a note in their place. A cached verdict includes the declared type:
+// an image a client labels differently must not borrow that verdict.
+func claudeImage(mediaType, data string) (string, string, string) {
+	key := fitKey(strconv.Itoa(len(mediaType))+":"+mediaType+data, claudeImageLimits)
 	e, ok := fitted.get(key)
 	if !ok {
-		e = claudeImageRefit(data)
+		e = claudeImageChecked(mediaType, data)
 		fitted.put(key, e)
 	}
-	if e.data == nil {
-		return mediaType, data
+	if e.mime == "text/plain" {
+		return "", "", claudeImageOmitted
 	}
-	return e.mime, base64.StdEncoding.EncodeToString(e.data)
+	if e.data == nil {
+		return e.mime, data, ""
+	}
+	return e.mime, base64.StdEncoding.EncodeToString(e.data), ""
 }
 
-// claudeImageRefit is the image scaled and written again, or an entry
-// with no data when it goes as it came.
-func claudeImageRefit(data string) fitEntry {
+// claudeImageType reads only the magic number, never the client's label.
+func claudeImageType(raw []byte) string {
+	switch {
+	case bytes.HasPrefix(raw, []byte("\x89PNG\r\n\x1a\n")):
+		return "image/png"
+	case bytes.HasPrefix(raw, []byte{0xff, 0xd8, 0xff}):
+		return "image/jpeg"
+	case bytes.HasPrefix(raw, []byte("GIF87a")), bytes.HasPrefix(raw, []byte("GIF89a")):
+		return "image/gif"
+	case len(raw) >= 12 && string(raw[:4]) == "RIFF" && string(raw[8:12]) == "WEBP":
+		return "image/webp"
+	}
+	return ""
+}
+
+// claudeImageComplete keeps a supported container Go cannot read (notably
+// animated WebP) for Anthropic to judge, but never a cut-off container.
+func claudeImageComplete(mt string, raw []byte) bool {
+	switch mt {
+	case "image/png":
+		for i := 8; len(raw)-i >= 12; {
+			n := uint64(binary.BigEndian.Uint32(raw[i:i+4])) + 12
+			if n > uint64(len(raw)-i) {
+				return false
+			}
+			if string(raw[i+4:i+8]) == "IEND" {
+				return true
+			}
+			i += int(n)
+		}
+	case "image/jpeg":
+		return claudeJPEGComplete(raw)
+	case "image/gif":
+		return claudeGIFComplete(raw)
+	case "image/webp":
+		n := uint64(binary.LittleEndian.Uint32(raw[4:8])) + 8
+		return n >= 12 && n <= uint64(len(raw))
+	}
+	return false
+}
+
+// claudeGIFComplete walks every frame: image.Decode reads only the first.
+// A trailer ends the image even when more bytes follow it.
+func claudeGIFComplete(raw []byte) bool {
+	if len(raw) < 13 {
+		return false
+	}
+	i := 13
+	if raw[10]&0x80 != 0 {
+		i += 3 << (raw[10]&7 + 1)
+	}
+	for i < len(raw) {
+		block := raw[i]
+		i++
+		switch block {
+		case 0x3b:
+			return true
+		case 0x21:
+			i++ // extension label
+		case 0x2c:
+			if len(raw)-i < 9 {
+				return false
+			}
+			packed := raw[i+8]
+			i += 9
+			if packed&0x80 != 0 {
+				i += 3 << (packed&7 + 1)
+			}
+			i++ // LZW code size
+		default:
+			return false
+		}
+		for {
+			if i >= len(raw) {
+				return false
+			}
+			n := int(raw[i])
+			i++
+			if n > len(raw)-i {
+				return false
+			}
+			i += n
+			if n == 0 {
+				break
+			}
+		}
+	}
+	return false
+}
+
+// claudeJPEGComplete skips metadata segments: an EXIF thumbnail's EOI
+// does not end the outer image. Stuffed bytes and restart markers inside
+// a scan have no length; every other segment says how far to skip.
+func claudeJPEGComplete(raw []byte) bool {
+	scan := false
+	for i := 2; i < len(raw); {
+		if raw[i] != 0xff {
+			if !scan {
+				return false
+			}
+			i++
+			continue
+		}
+		for i < len(raw) && raw[i] == 0xff {
+			i++
+		}
+		if i == len(raw) {
+			return false
+		}
+		marker := raw[i]
+		i++
+		switch {
+		case marker == 0xd9:
+			return true
+		case marker == 0 || marker >= 0xd0 && marker <= 0xd7:
+			if !scan {
+				return false
+			}
+			continue
+		}
+		if i+2 > len(raw) {
+			return false
+		}
+		n := int(binary.BigEndian.Uint16(raw[i : i+2]))
+		if n < 2 || n > len(raw)-i {
+			return false
+		}
+		i += n
+		scan = marker == 0xda
+	}
+	return false
+}
+
+func claudeImageChecked(declared, data string) fitEntry {
+	mt := imageMediaType(Part{Data: data})
+	omit := func(reason string, size int) fitEntry {
+		log.Printf("claude: image replaced by a note (declared %q, found %q, %d bytes): %s", declared, mt, size, reason)
+		return fitEntry{mime: "text/plain"}
+	}
+	if len(data) > codexImageMaxBytes {
+		return omit("image exceeds the read limit", base64.StdEncoding.DecodedLen(len(data)))
+	}
 	raw, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
-		return fitEntry{}
+		return omit("invalid base64", len(raw))
+	}
+	// A line break in the base64 head can leave too few bytes to sniff.
+	mt = claudeImageType(raw)
+	// GIF decoding stops at the first frame; WebP may promise more chunks.
+	// PNG and JPEG decoding reads to the end of the image itself.
+	if (mt == "image/gif" || mt == "image/webp") && !claudeImageComplete(mt, raw) {
+		return omit("incomplete image container", len(raw))
 	}
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
 	if err != nil {
-		return fitEntry{}
+		if claudeImageComplete(mt, raw) {
+			return fitEntry{mime: mt}
+		}
+		return omit("unreadable image header", len(raw))
 	}
 	holds, ok := imageHolds(cfg, format)
-	if !ok || len(raw)+holds > codexImageMaxBytes {
-		return fitEntry{}
+	if !ok || holds > codexImageMaxBytes-len(raw) {
+		if claudeImageComplete(mt, raw) {
+			return fitEntry{mime: mt}
+		}
+		return omit("image exceeds the decode limit", len(raw))
 	}
-	var src image.Image
-	switch format {
-	case "png":
-		src, err = png.Decode(bytes.NewReader(raw))
-	case "jpeg":
-		src, err = jpeg.Decode(bytes.NewReader(raw))
-	case "gif":
-		src, err = gif.Decode(bytes.NewReader(raw))
-	case "webp":
-		src, err = webp.Decode(bytes.NewReader(raw))
-	default:
-		return fitEntry{}
-	}
+	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
-		return fitEntry{}
+		if claudeImageComplete(mt, raw) {
+			return fitEntry{mime: mt}
+		}
+		return omit("unreadable image", len(raw))
 	}
+	if mt != "" && cfg.Width <= claudeImageSide && cfg.Height <= claudeImageSide && len(data) <= claudeImageBase64 {
+		return fitEntry{mime: mt}
+	}
+	e := claudeImageRefit(src, cfg, format)
+	if e.data == nil {
+		return omit("image could not be re-encoded", len(raw))
+	}
+	reason := "image exceeds inline limits"
+	if mt == "" {
+		reason = "unsupported image type"
+	}
+	log.Printf("claude: image re-encoded as %s (declared %q, found %q, %d bytes): %s", e.mime, declared, "image/"+format, len(raw), reason)
+	return e
+}
+
+// claudeImageRefit scales a decoded image and writes it within the limits.
+func claudeImageRefit(src image.Image, cfg image.Config, format string) fitEntry {
+	var err error
 	w, h := cfg.Width, cfg.Height
 	if scale := math.Min(float64(claudeImageSide)/float64(max(w, h)), 1); scale < 1 {
 		w = max(int(math.Round(float64(w)*scale)), 1)

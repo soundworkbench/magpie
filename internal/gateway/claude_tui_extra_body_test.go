@@ -162,7 +162,8 @@ func TestClaudeTUIClientCacheKeepsItsOwn(t *testing.T) {
 // Claude Code runs it as -p instead.
 func TestClaudeTUIImageByURL(t *testing.T) {
 	h := tuiScriptHarness(t, "")
-	srv, hits := secret(t, string(pngBytes))
+	imageBytes := replayImage(t, "png")
+	srv, hits := secret(t, string(imageBytes))
 	allowPrivate(t, "127.0.0.1")
 	ask := func(url string, said ...string) (int, string) {
 		t.Helper()
@@ -185,7 +186,7 @@ func TestClaudeTUIImageByURL(t *testing.T) {
 	if len(runs) != 1 || hits.Load() != 1 {
 		t.Fatalf("%d runs, the image downloaded %d times", len(runs), hits.Load())
 	}
-	data := base64.StdEncoding.EncodeToString(pngBytes)
+	data := base64.StdEncoding.EncodeToString(imageBytes)
 	for _, log := range runs {
 		if !strings.Contains(log, `"data":"`+data+`"`) || !strings.Contains(log, `"media_type":"image/png"`) {
 			t.Fatalf("Claude Code wasn't handed the image's bytes: %s", log)

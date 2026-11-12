@@ -1,14 +1,14 @@
 # soundworkbench/magpie：本地构建
 
-> English summary: this fork carries two small patches on top of an upstream magpie release, on the `local` branch. `soundworkbench/build.sh` builds the image `magpie-local:<upstream version>-xm` from that branch, after running the patches' tests.
+> English summary: this fork carries small patches on top of an upstream magpie release, on the `local` branch. `soundworkbench/build.sh` builds the image `magpie-local:<upstream version>-xm` from that branch, after running the patches' tests.
 
 ## 为什么有这个分叉
 
-我们的 magpie 跑在上游发布版上，另加两个上游没有的补丁。补丁放在 `local` 分支：`local` = 上游某个发布标签 + 我们的提交。`main` 跟上游，不放我们的改动。
+我们的 magpie 跑在上游发布版上，另加上游没有的补丁。补丁放在 `local` 分支：`local` = 上游某个发布标签 + 我们的提交。`main` 跟上游，不放我们的改动。
 
 镜像只从 `local` 构建。家里节点和公司节点都跑同一份镜像。
 
-## 两个补丁
+## 补丁
 
 ### 1. routing: a Remote magpie is weighed by its account's windows
 
@@ -34,9 +34,17 @@
 
 上游为什么没有：待确认。
 
+### 3. gateway: an image Claude refuses does not break the replay
+
+问题：重放历史消息或传入工具结果时，图片的声明类型与真实字节不符、格式不受支持或文件不完整，会让 Claude Code 拒绝整轮对话。
+
+做法：按字节识别 PNG、JPEG、GIF、WebP；能读取的其他格式转成 PNG，无法读取的图片换成一行说明。完整但 Go 无法解码的受支持格式保留给 Anthropic 判断，正确标注且无需缩放的图片保持原字节。检查结果缓存，重放不重复解码。Claude Code 的 `media_removed` 若自行继续，就等待重发的回复；若未能回复，则返回 400 `invalid_request_error`，已开始的流发送错误事件，不轮换或休息账号。
+
+改动：`internal/gateway/claude_images.go`、`claude_subscription.go`、`internal/claudetui/transcript.go` 及其测试。构建前新增 `ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved`，并测试 `./internal/claudetui/`。当前轮图片粘贴文件的路径不变。
+
 ### 是否提给上游
 
-两个补丁都没有提给上游。上游只接受协作者的 PR，社区的修复以 issue 的形式提交（见 `docs/contributors.md`）。补丁 1 修的是上游调度里一个可复现的不一致，适合附补丁提 issue；补丁 2 依赖 ChatGPT 后端的 open 接口，上游是否接受待确认。上游合入同等修复后，在下一次变基时丢掉我们的那个提交。
+这些补丁尚未提给上游。上游只接受协作者的 PR，社区的修复以 issue 的形式提交（见 `docs/contributors.md`）。补丁 1 修的是上游调度里一个可复现的不一致，适合附补丁提 issue；补丁 2 依赖 ChatGPT 后端的 open 接口，上游是否接受待确认。上游合入同等修复后，在下一次变基时丢掉我们的那个提交。
 
 ## 维护 local 分支
 
@@ -58,7 +66,7 @@ git rebase --onto v0.1.3400 v0.1.3315 local
 1. 按上游新代码改我们的提交，保持补丁的行为不变。
 2. 跑这个补丁的测试（见下面“构建”里的测试名），通过后 `git rebase --continue`。
 3. 根目录 `README.md` 冲突时，保留我们的版本（`git checkout --theirs README.md`，变基时 theirs 指我们的提交）。上游的介绍从链接看。
-4. 上游已经有同等修复时，`git rebase --skip` 丢掉这个提交，并在本文“两个补丁”里删掉它。
+4. 上游已经有同等修复时，`git rebase --skip` 丢掉这个提交，并在本文“补丁”里删掉它。
 4. 改不动又不能丢时，停在当前版本，不升级。
 
 变基后推送：
@@ -79,7 +87,7 @@ soundworkbench/build.sh <提交>     # 从指定提交构建
 脚本做三件事：
 
 1. 用 `git archive` 取出这个提交的源码，工作树里没提交的改动不进镜像。
-2. 在 `golang:1.26-alpine` 里跑两个补丁的测试：`RemoteAllowance|WebFetch|FetchVerification|CodexFetchText`（`./internal/provider/`、`./internal/gateway/`）。不过就停，退出码 3。
+2. 在 `golang:1.26-alpine` 里跑补丁的测试：`RemoteAllowance|WebFetch|FetchVerification|CodexFetchText|ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved`（`./internal/provider/`、`./internal/gateway/`、`./internal/claudetui/`）。不过就停，退出码 3。
 3. 构建镜像，打两个标签，打印版本。
 
 版本号规则：
@@ -126,4 +134,4 @@ soundworkbench/build.sh <提交>     # 从指定提交构建
 
 ## 已知问题
 
-- 完整跑 `./internal/gateway/` 的测试，在 v0.1.3315-xm 上有 3 项不过：`TestClaudeBridgeSafeguardContextUpdates`、`TestClaudeClientCacheAbsentUnchanged`、`TestRefusalAfterShownThinkingGoesToTheNext`。上游 CI 在 v0.1.3315 上全部测试通过；这 3 项是补丁引起还是本地测试环境引起，待确认。`build.sh` 只跑两个补丁的测试。
+- 完整跑 `./internal/gateway/` 的测试，在 v0.1.3315-xm 上有 3 项不过：`TestClaudeBridgeSafeguardContextUpdates`、`TestClaudeClientCacheAbsentUnchanged`、`TestRefusalAfterShownThinkingGoesToTheNext`。上游 CI 在 v0.1.3315 上全部测试通过；这 3 项是补丁引起还是本地测试环境引起，待确认。`build.sh` 只跑上述补丁的测试。
