@@ -781,7 +781,12 @@ held to Claude's models read `limited: false` there and 403 on the line).
 It names no account. `TestStatuslineHeldKeyScope`. A key may hold up to five
 limits at once, each in its own window, and a request needs every one
 (#2227, `budget.Reserve`: one reservation per window, and a refusal names
-the spent limit that resets last). The saved key keeps the first limit in
+the spent limit that resets last). This fork defaults to refusing only once
+settled usage reaches a cap (`budget.HoldReservations = false`), including
+when excluding a model from routing candidates. In-flight reservations are
+still recorded, displayed and released; enabling `HoldReservations` restores
+upstream admission based on used plus reserved tokens/cost. Concurrent calls
+can therefore overshoot a cap before their usage settles. The saved key keeps the first limit in
 `limit`, which older magpie reads, and the rest in `moreLimits`. The answer's
 `limit` is the one holding the key most (`budget.Binding`), what older
 clients read, and `limits` is each of them (`budget.All`). Holding a
@@ -812,6 +817,28 @@ prefers a whole-key limit, and a remote's key card leaves such limits out
 `TestScoped*` in `internal/budget`. A local magpie
 asks it with each of its remote-magpie keys for that key's card on its
 Usage page (#1547), a window per limit's cap.
+
+The fork's offline budget replay is `TestBudgetReplay` in
+[`replay_test.go`](../../internal/budget/replay_test.go). Set
+`MAGPIE_BUDGET_REPLAY` to a usage JSONL and `MAGPIE_BUDGET_REPLAY_LIMITS` to
+JSON mapping key ids to arrays of `access.Limit`, then run
+`go test -p 1 -tags nogui -count=1 -v ./internal/budget/ -run '^TestBudgetReplay$'`.
+Each mode gets an empty ledger: admitted calls settle through `budget.Append`
+at their end events, retaining their original start stamps; refused calls
+add no usage. Equal-time completions precede new starts, and zero-duration
+calls settle immediately. The report lists admissions, refusals, refusals
+below every applicable actual cap, and each original window's final excess
+(including late completions). Reported, probe/tool/search and remote-computer
+rows are excluded. Pricing uses the normal ledger coster, including recorded
+`cost` values. Each key's `unpriced` counts input rows with unknown cost in
+any of its cost-limited model scopes, including refused rows, once per key;
+any nonzero count fails `TestBudgetReplay`. Window counts cover settled rows.
+The temporary provider catalog includes recorded subscription ids, and a
+row missing provider/model uses `req` for admission without changing its
+rejection status. The isolated test environment
+does not import live custom prices, provider rate windows or model aliases.
+`TestBudgetReplaySample` supplies synthetic prices and tests both modes,
+including overlapping calls and a late completion across midnight.
 
 A key's `MaxConcurrency` (young02036 on Discord; `access.Key`, set by the
 `concurrency-key` action, the key row's "at once" badge or `magpie
