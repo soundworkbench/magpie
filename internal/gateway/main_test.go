@@ -34,6 +34,10 @@ func TestMain(m *testing.M) {
 	// the tests serve their Remote magpie from this process, which is
 	// then this magpie itself (remote_self_test.go turns it on again)
 	provider.LeaveOutSelf = false
+	// the tests count what their Remote magpie is asked: a load reading,
+	// fetched behind a request, is none of theirs (the load guard's own
+	// tests give their readings, load_guard_routing_test.go)
+	remoteLoad = func(provider.Provider) (provider.LoadReading, bool) { return provider.LoadReading{}, false }
 	code, err := isolatedTests(m)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

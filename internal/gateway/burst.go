@@ -79,10 +79,10 @@ func burstSpread(routing string, g *provider.Group, sameMember, reorder bool, cs
 func burstAlike(routing string, g *provider.Group, sameMember bool, cs []candidate, order []Weighed, i int) bool {
 	a, b := order[0], order[i]
 	c0, ci := cs[0], cs[i]
-	if a.Rest != nil || a.Aside || a.Reserve > 0 || c0.capped != nil || ci.capped != nil {
+	if a.Loaded != "" || a.Rest != nil || a.Aside || a.Reserve > 0 || c0.capped != nil || ci.capped != nil {
 		return false
 	}
-	if b.Rest != nil || b.Aside || b.Reserve > 0 || b.Barred || b.Held || standsIn(order, i) || lastBehind(order, i) || busyBehind(order, i) {
+	if b.Loaded != "" || b.Rest != nil || b.Aside || b.Reserve > 0 || b.Barred || b.Held || standsIn(order, i) || lastBehind(order, i) || busyBehind(order, i) {
 		return false
 	}
 	if a.Fallback != b.Fallback || a.Fit != b.Fit || a.Speaks != b.Speaks || c0.noURL != ci.noURL || !slices.Equal(a.Via, b.Via) {

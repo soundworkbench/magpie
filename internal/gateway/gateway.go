@@ -891,6 +891,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	go provider.KeepListsFresh(ctx)
 	// and follows a Remote magpie's list as it changes there (KaCli)
 	go provider.KeepRemoteListsFollowed(ctx)
+	go provider.KeepRemoteLoads(ctx)
 	// and keeps the community's plugins up to date, noting others' updates, and the Bun they run on
 	go plugin.KeepUpdated(ctx)
 	go plugin.KeepBunUpdated(ctx)
@@ -1014,6 +1015,7 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("POST /v1/magpie/usage/requests", s.usageIngest)
 	mux.HandleFunc("GET /v1/magpie/quotas/history", s.quotasHistory)
 	mux.HandleFunc("GET "+provider.RemoteCardsPath, s.quotaCards)
+	mux.HandleFunc("GET "+provider.RemoteLoadPath, s.load)
 	mux.HandleFunc("POST "+provider.RemoteRefreshPath, s.quotaCardsRefresh)
 	mux.HandleFunc("POST "+provider.RemoteCodexResetPath, s.codexReset)
 	mux.HandleFunc("GET /v1/magpie/route", s.sessionRoute)
@@ -1878,8 +1880,11 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	model, _ = askedAt(model) // counted as the model, whatever its effort
 	id := unprefixed(model)
+	// Resolve and every count guard use the same group as generation.
 	if own, ok := ownFirst(r, agentOf(r), id); ok {
 		id = own // counted where serve sends it
+	} else if gid, ok := keyGroupFor(r, id); ok {
+		id = gid
 	} else if sid, ok := provider.AutoStandInFor(agentOf(r), id); ok {
 		id = sid
 	}
@@ -1898,6 +1903,9 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	r = heldByGroupAt(r, id)
 	// nor on one the user disabled (#1867)
 	if countOff(w, provider.Anthropic, id) {
+		return
+	}
+	if countPrefixedOff(w, provider.Anthropic, id) {
 		return
 	}
 	// nor on a decision model or a group of them, which hold no
@@ -2208,12 +2216,22 @@ func (s *Server) gemini(w http.ResponseWriter, r *http.Request) {
 	case "streamGenerateContent":
 		stream = true
 	case "countTokens":
+		if own, ok := ownFirst(r, agentOf(r), model); ok {
+			model = own
+		} else if gid, ok := keyGroupFor(r, model); ok {
+			model = gid
+		} else if sid, ok := provider.AutoStandInFor(agentOf(r), model); ok {
+			model = sid
+		}
 		// a gateway key held to some models (#882) counts no tokens on one
 		// it may not use, as it would be refused serving it
 		if countHeld(w, r, provider.Gemini, model) {
 			return
 		}
 		if countOff(w, provider.Gemini, model) { // nor a disabled one (#1867)
+			return
+		}
+		if countPrefixedOff(w, provider.Gemini, model) {
 			return
 		}
 		s.geminiCount(w, model, body)

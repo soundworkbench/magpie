@@ -6,8 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -44,12 +42,7 @@ func TestRequestsParseUnchangedSettingsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	was, _ := os.ReadFile(settings.Path())
-	t.Cleanup(func() { os.WriteFile(settings.Path(), was, 0o600) })
-	os.MkdirAll(filepath.Dir(settings.Path()), 0o755)
-	if err := os.WriteFile(settings.Path(), raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeSettingsFile(t, raw)
 	gw := httptest.NewServer(New().Handler())
 	t.Cleanup(gw.Close)
 	ask := func() {

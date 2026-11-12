@@ -107,6 +107,23 @@ func countOff(w http.ResponseWriter, proto provider.Protocol, id string) bool {
 	return refuseOff(w, proto, id)
 }
 
+// countPrefixedOff keeps a refused provider prefix from getting a local
+// estimate where generation returns 404. Bare names keep their count behavior,
+// and an exact catalog id or a self remote that resolves still counts.
+func countPrefixedOff(w http.ResponseWriter, proto provider.Protocol, id string) bool {
+	if !strings.Contains(id, "/") {
+		return false
+	}
+	if _, _, ok := provider.Resolve(id); ok {
+		return false
+	}
+	if p, off := provider.SwitchedOff(id); off {
+		writeError(w, proto, http.StatusNotFound, switchedOff(p, id))
+		return true
+	}
+	return false
+}
+
 // codexNativeOff is the refusal for one of Codex's own models, asked at
 // the ChatGPT backend's route by its bare id: disabled by that id, or as
 // the codex provider's ("codex/gpt-5.5").

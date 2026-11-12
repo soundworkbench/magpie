@@ -321,6 +321,92 @@ func imageHolds(cfg image.Config, format string) (int, bool) {
 	return int(pixels) * bytesPerPixel, true
 }
 
+// jpegCoefficientHolds counts the coefficients a progressive JPEG keeps
+// until its last scan, on top of its decoded pixels. Only the header is
+// read, so a large EXIF segment costs no image-sized allocation.
+func jpegCoefficientHolds(r io.Reader) int64 {
+	var b [6]byte
+	if _, err := io.ReadFull(r, b[:2]); err != nil || b[0] != 0xff || b[1] != 0xd8 {
+		return 0
+	}
+	for {
+		if _, err := io.ReadFull(r, b[:2]); err != nil {
+			return 0
+		}
+		// image/jpeg tolerates stray bytes between markers too.
+		for b[0] != 0xff {
+			b[0] = b[1]
+			if _, err := io.ReadFull(r, b[1:2]); err != nil {
+				return 0
+			}
+		}
+		for b[1] == 0xff {
+			if _, err := io.ReadFull(r, b[1:2]); err != nil {
+				return 0
+			}
+		}
+		marker := b[1]
+		switch {
+		case marker == 0xda || marker == 0xd9:
+			return 0
+		case marker == 0 || marker == 0x01 || marker == 0xd8 || marker >= 0xd0 && marker <= 0xd7:
+			continue
+		}
+		if _, err := io.ReadFull(r, b[:2]); err != nil {
+			return 0
+		}
+		n := int64(binary.BigEndian.Uint16(b[:2])) - 2
+		if n < 0 {
+			return 0
+		}
+		// C4, C8 and CC are tables or extensions, not frame headers.
+		if marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc {
+			if marker != 0xc2 || n < 6 {
+				return 0
+			}
+			if _, err := io.ReadFull(r, b[:]); err != nil {
+				return 0
+			}
+			if n != 6+3*int64(b[5]) {
+				return 0
+			}
+			components := int(b[5])
+			if components != 1 && components != 3 && components != 4 {
+				return 0 // image/jpeg rejects other component counts.
+			}
+			var sampling [12]byte
+			if _, err := io.ReadFull(r, sampling[:3*components]); err != nil {
+				return 0
+			}
+			w, h := int64(binary.BigEndian.Uint16(b[3:5])), int64(binary.BigEndian.Uint16(b[1:3]))
+			var hmax, vmax, blocks int64
+			for i := 0; i < components; i++ {
+				hv := sampling[3*i+1]
+				hi, vi := int64(hv>>4), int64(hv&15)
+				if hi < 1 || hi > 4 || vi < 1 || vi > 4 || hi == 3 || vi == 3 {
+					return 0 // image/jpeg rejects these factors before allocating.
+				}
+				// image/jpeg/reader.go:processSOF treats a single component
+				// as 1x1 regardless of its nominal sampling factors.
+				if components == 1 {
+					hi, vi = 1, 1
+				}
+				hmax, vmax = max(hmax, hi), max(vmax, vi)
+				blocks += hi * vi
+			}
+			// image/jpeg/scan.go:processSOS allocates mxx*myy*hi*vi blocks
+			// per component, each 64 int32s. processSOF ensures the first
+			// component has the maximum factors for supported layouts.
+			// Other layouts retain this bounded count; the decoder rejects them.
+			mxx, myy := (w+8*hmax-1)/(8*hmax), (h+8*vmax-1)/(8*vmax)
+			return min(64*4*mxx*myy*blocks, int64(holdsMost))
+		}
+		if _, err := io.CopyN(io.Discard, r, n); err != nil {
+			return 0
+		}
+	}
+}
+
 // fitHolds is what making an image of url will hold, from its header
 // alone, so that nothing is decoded to find out: its pixels and the bytes
 // they came in, as codexImageRefit counts them. The header is read from
@@ -343,6 +429,9 @@ func fitHolds(url string) int {
 	holds, ok := imageHolds(cfg, format)
 	if !ok {
 		return 0
+	}
+	if format == "jpeg" {
+		holds = min(holds+int(jpegCoefficientHolds(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64)))), holdsMost)
 	}
 	return min(base64.StdEncoding.DecodedLen(len(b64))+holds, holdsMost)
 }
@@ -472,6 +561,9 @@ func codexImageRefit(b64 string, l imageLimits) fitEntry {
 	// what the pixels and the bytes they came in will hold together, so
 	// that a header of a few bytes can't ask for a gigabyte
 	holds, ok := imageHolds(cfg, format)
+	if format == "jpeg" {
+		holds = min(holds+int(jpegCoefficientHolds(bytes.NewReader(raw))), holdsMost)
+	}
 	if !ok || len(raw)+holds > codexImageMaxBytes {
 		return fitEntry{}
 	}

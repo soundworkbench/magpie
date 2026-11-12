@@ -330,9 +330,10 @@ func foundGroup(g provider.Group) bool {
 // model it may use, is that model for the key, as it would be were there
 // no such group — the key is held away from the group, not from the model
 // (a group the user named gemini-3.8, a key given google/gemini-3.8
-// asking for gemini-3.8). A vendor prefix naming no enabled provider can
-// also name a group (PrefixedGroupFor), but only when the key may use it;
-// otherwise the original prefixed id keeps its existing resolution.
+// asking for gemini-3.8). A vendor prefix naming no provider, or one that
+// is only not ready and not refused by SwitchedOff, can also name a group
+// (PrefixedGroupFor), but only when the key may use it; otherwise the
+// original prefixed id keeps its existing resolution.
 func keyGroupFor(r *http.Request, id string) (string, bool) {
 	gid, ok := provider.GroupFor(id)
 	prefixed := false
