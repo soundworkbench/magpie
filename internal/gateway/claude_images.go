@@ -48,32 +48,99 @@ import (
 // for byte. A BMP within the conversion limit goes as PNG. A TIFF, a HEIC
 // the gateway did not convert at the door, any other format, or an
 // incomplete or unreadable image goes as a note. Complete supported
-// containers Go cannot decode go to Anthropic unchanged, with their real type.
+// containers Go cannot decode go to Anthropic unchanged, with their real
+// type, unless a WebP frame mismatches its canvas or progressive JPEG
+// coefficients exceed the decode limit. A busy decode goes as a note and
+// is tried again on the next turn.
 const (
 	claudeImageSide   = 2000
 	claudeImageBase64 = 5 << 20
 )
 
-// A BMP decoder holds at most 4 bytes a pixel. With the refit's RGBA copy
-// and row buffer, 3840x2160 is about 190 MiB at 24 bytes a pixel (161 MiB
-// live measured). A 1x8,294,400 32-bit BMP keeps a 16-byte row buffer per
-// source row and about as much in weights: about 290 MiB including its
-// bytes. Both fit the 320 MiB budget, and only one conversion runs at a time.
+// BMP keeps its pixel limit even when its decode, refit and encode fit
+// the shared byte budget. The budget does not count the source bytes.
 const claudeImageConvertPixels = 3840 * 2160
 
-// One BMP conversion runs at a time, including the refit. A conversion
-// that cannot get the slot within the wait is given up, so a queue cannot
-// hold requests and their bytes without bound.
+// All decodes share this budget through refit and encoding. It bounds
+// their combined holds, excluding raw, except that an image whose cost
+// exceeds the capacity takes it all and runs alone. A bounded wait lets
+// a busy request return a note and try the image again next turn.
 var (
-	claudeImageConvertSlot = make(chan struct{}, 1)
-	claudeImageConvertWait = 20 * time.Second
+	claudeImageDecodeBudget claudeImageByteBudget
+	claudeImageConvertWait  = 20 * time.Second
 )
+
+type claudeImageByteBudget struct {
+	mu      sync.Mutex
+	used    int
+	changed chan struct{}
+}
+
+func (b *claudeImageByteBudget) acquire(n int, wait time.Duration) bool {
+	if n <= 0 || n > codexImageMaxBytes {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		b.mu.Lock()
+		if n <= codexImageMaxBytes-b.used {
+			b.used += n
+			b.mu.Unlock()
+			return true
+		}
+		if b.changed == nil {
+			b.changed = make(chan struct{})
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-changed:
+		case <-timer.C:
+			return false
+		}
+	}
+}
+
+func (b *claudeImageByteBudget) release(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.used -= n
+	if b.changed != nil {
+		close(b.changed)
+		b.changed = nil
+	}
+}
+
+// claudeImageDecodeWeight counts the source and what the refit can keep
+// beside it. triangleResize copies 4*sw*sh RGBA bytes and holds 16*w*sh
+// float32 bytes between passes. Its two sets of triangleWeights have at
+// most 2*src+2*n floats per axis; allow doubled slice capacity, taps and
+// allocation rounding with 16*(sw+sh)+96*(w+h). The output allowance is
+// 8 bytes a pixel for resized/flattened copies plus 72 for encoded bytes
+// and bytes.Buffer growth (at most 24 per pixel, including JPEG stuffing,
+// rounded to 16x16 JPEG MCU bounds). Another 2 MiB covers encoder state and rows.
+func claudeImageDecodeWeight(cfg image.Config, holds int, refit bool) int {
+	cost := int64(holds)
+	if refit {
+		sw, sh := int64(cfg.Width), int64(cfg.Height)
+		w, h := cfg.Width, cfg.Height
+		if scale := math.Min(float64(claudeImageSide)/float64(max(w, h)), 1); scale < 1 {
+			w = max(int(math.Round(float64(w)*scale)), 1)
+			h = max(int(math.Round(float64(h)*scale)), 1)
+			cost += 4*sw*sh + 16*int64(w)*sh + 16*(sw+sh) + 96*int64(w+h)
+		}
+		cost += 80*int64((w+15)/16*16)*int64((h+15)/16*16) + 2<<20
+	}
+	return int(min(cost, int64(codexImageMaxBytes)))
+}
 
 // claudeImageLimits keys the images claudeImage made in fitted, apart
 // from Codex's.
 var claudeImageLimits = imageLimits{side: claudeImageSide, patches: -1}
 
 const claudeImageOmitted = "[An image was left out: the gateway could not read it]"
+const claudeImageOmittedBusy = "[An image was left out: the gateway was busy with other images; it will be tried again on the next turn]"
 const claudeImageOmittedTIFF = "[An image was left out: TIFF images are not supported here; send it as PNG or JPEG]"
 const claudeImageOmittedHEIC = "[An image was left out: this HEIC image could not be converted; send it as PNG or JPEG]"
 
@@ -168,10 +235,12 @@ func claudeImageReadRecord(declared, data string) claudeImageRecord {
 		record.found = "image/tiff"
 	} else if isHEIC(head) {
 		record.found = "image/heic"
-	} else if cfg, format, err := image.DecodeConfig(io.LimitReader(rd, 1<<20)); err == nil {
-		record.width, record.height = cfg.Width, cfg.Height
-		if record.found == "" {
-			record.found = "image/" + format
+	} else if record.found != "" || bytes.HasPrefix(head, []byte("BM")) {
+		if cfg, format, err := image.DecodeConfig(io.LimitReader(rd, 1<<20)); err == nil {
+			record.width, record.height = cfg.Width, cfg.Height
+			if record.found == "" {
+				record.found = "image/" + format
+			}
 		}
 	}
 	_, _ = io.Copy(io.Discard, rd)
@@ -325,6 +394,86 @@ func claudeJPEGComplete(raw []byte) bool {
 	return false
 }
 
+// VP8X gives DecodeConfig the canvas, but VP8L allocates from its own
+// frame header before webp compares the two. Read that header first.
+func claudeImageWebPFrame(raw []byte) (width, height int, ok bool) {
+	if claudeImageType(raw) != "image/webp" || len(raw) < 20 || string(raw[12:16]) != "VP8X" {
+		return 0, 0, false
+	}
+	end := int(min(uint64(len(raw)), uint64(binary.LittleEndian.Uint32(raw[4:8]))+8))
+	for i := 12; end-i >= 8; {
+		kind := string(raw[i : i+4])
+		n := uint64(binary.LittleEndian.Uint32(raw[i+4 : i+8]))
+		i += 8
+		data := raw[i : i+int(min(n, uint64(end-i)))]
+		switch kind {
+		case "VP8L":
+			if len(data) >= 5 && data[0] == 0x2f {
+				bits := binary.LittleEndian.Uint32(data[1:5])
+				return int(bits&0x3fff) + 1, int(bits>>14&0x3fff) + 1, true
+			}
+			return 0, 0, false
+		case "VP8 ":
+			if len(data) >= 10 && bytes.Equal(data[3:6], []byte{0x9d, 0x01, 0x2a}) {
+				return int(binary.LittleEndian.Uint16(data[6:8]) & 0x3fff), int(binary.LittleEndian.Uint16(data[8:10]) & 0x3fff), true
+			}
+			return 0, 0, false
+		}
+		n += n & 1
+		if n > uint64(end-i) {
+			break
+		}
+		i += int(n)
+	}
+	return 0, 0, false
+}
+
+// Progressive JPEG keeps coefficient blocks for every component until
+// the last scan, besides the pixels counted by imageHolds.
+func claudeImageHolds(cfg image.Config, format string, raw []byte) (int, bool) {
+	holds, ok := imageHolds(cfg, format)
+	if !ok || holds == holdsMost || format != "jpeg" || !bytes.HasPrefix(raw, []byte{0xff, 0xd8}) {
+		return holds, ok
+	}
+	for i := 2; i < len(raw); {
+		if raw[i] != 0xff {
+			// image/jpeg tolerates stray bytes between markers.
+			i++
+			continue
+		}
+		for i < len(raw) && raw[i] == 0xff {
+			i++
+		}
+		if i == len(raw) {
+			break
+		}
+		marker := raw[i]
+		i++
+		if marker == 0xda || marker == 0xd9 {
+			break
+		}
+		if marker == 0 || marker == 0x01 || marker >= 0xd0 && marker <= 0xd8 {
+			continue
+		}
+		if len(raw)-i < 2 {
+			break
+		}
+		n := int(binary.BigEndian.Uint16(raw[i : i+2]))
+		if n < 2 || n > len(raw)-i {
+			break
+		}
+		if marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc {
+			if marker == 0xc2 && n >= 8 {
+				cost := int64(holds) + 4*int64(raw[i+7])*int64(cfg.Width)*int64(cfg.Height)
+				return int(min(cost, int64(holdsMost))), true
+			}
+			break
+		}
+		i += n
+	}
+	return holds, ok
+}
+
 func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEntry, bool) {
 	declared = strings.Clone(declared[:min(len(declared), 64)])
 	mt := ""
@@ -361,6 +510,10 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 		e.data = []byte(claudeImageOmittedHEIC)
 		return e, true
 	}
+	mt = record.found
+	if mt == "" && !bytes.HasPrefix(raw, []byte("BM")) {
+		return omit("unsupported image type", len(raw)), true
+	}
 	cfg, format, headerErr := image.DecodeConfig(bytes.NewReader(raw))
 	if headerErr == nil {
 		record.width, record.height = cfg.Width, cfg.Height
@@ -389,23 +542,29 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 	if format == "bmp" && cfg.Width > 0 && cfg.Height > 0 && (cfg.Width > claudeImageConvertPixels || cfg.Height > claudeImageConvertPixels/cfg.Width) {
 		return omit("image too large to convert", len(raw)), true
 	}
-	holds, ok := imageHolds(cfg, format)
+	if w, h, ok := claudeImageWebPFrame(raw); ok && (w != cfg.Width || h != cfg.Height) {
+		return omit("WebP frame does not match its canvas", len(raw)), true
+	}
+	holds, ok := claudeImageHolds(cfg, format, raw)
 	if !ok || holds > codexImageMaxBytes-len(raw) {
+		// A progressive frame whose coefficients exceed the limit must
+		// not borrow the complete-container fallback for unreadable files.
+		if pixels, _ := imageHolds(cfg, format); format == "jpeg" && holds > pixels {
+			return omit("image exceeds the decode limit", len(raw)), true
+		}
 		if claudeImageComplete(mt, raw) {
 			return fitEntry{mime: mt}, true
 		}
 		return omit("image exceeds the decode limit", len(raw)), true
 	}
-	if format == "bmp" {
-		timer := time.NewTimer(claudeImageConvertWait)
-		defer timer.Stop()
-		select {
-		case claudeImageConvertSlot <- struct{}{}:
-			defer func() { <-claudeImageConvertSlot }()
-		case <-timer.C:
-			return omit("conversion slot busy", len(raw)), false
-		}
+	refit := mt == "" || cfg.Width > claudeImageSide || cfg.Height > claudeImageSide || len(data) > claudeImageBase64
+	weight := claudeImageDecodeWeight(cfg, holds, refit)
+	if !claudeImageDecodeBudget.acquire(weight, claudeImageConvertWait) {
+		e := omit("conversion slot busy", len(raw))
+		e.data = []byte(claudeImageOmittedBusy)
+		return e, false
 	}
+	defer claudeImageDecodeBudget.release(weight)
 	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		if claudeImageComplete(mt, raw) {
@@ -413,7 +572,7 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 		}
 		return omit("unreadable image", len(raw)), true
 	}
-	if mt != "" && cfg.Width <= claudeImageSide && cfg.Height <= claudeImageSide && len(data) <= claudeImageBase64 {
+	if !refit {
 		return fitEntry{mime: mt}, true
 	}
 	e := claudeImageRefit(src, cfg, format)
