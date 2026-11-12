@@ -79,8 +79,10 @@ type subscriptionBridge struct {
 	idle    map[string]*subscriptionRun // conversation so far (turnKey) → run
 	shelf   map[string]*savedSession    // conversation so far (turnKey) → its saved session
 	baseURL string
-	sweep   sync.Once
-	swept   sync.Map // Claude Code's project folders sweepSessions went through
+	// idleDuration overrides the settings duration for timer tests; set before use.
+	idleDuration func() time.Duration
+	sweep        sync.Once
+	swept        sync.Map // Claude Code's project folders sweepSessions went through
 	// lost is why each run that had a conversation ended, by that
 	// conversation (convKey), and lostCalls by the tool calls it waited
 	// on or was last handed results for, for the log of a request that
@@ -239,11 +241,14 @@ type subscriptionRun struct {
 	// takeNamedOwner), and idleKey and idleAt say it is waiting for one.
 	// convKey is the conversation it has had, whatever the model
 	// (conversationKeys).
-	stdin   io.WriteCloser
-	owner   atomic.Pointer[string]
-	idleKey string
-	idleAt  time.Time
-	convKey string
+	stdin          io.WriteCloser
+	owner          atomic.Pointer[string]
+	idleKey        string
+	idleAt         time.Time
+	idleGeneration uint64
+	idleGuard      *time.Timer
+	idleReclaimed  bool
+	convKey        string
 	// convPrev is the boundary before convKey's (conversationKeys): the
 	// conversation as the client has it, when the run went on with a side
 	// question after its last turn — a prompt suggestion — whose exchange
@@ -1933,6 +1938,7 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 		}
 	}
 	if run != nil {
+		run.stopIdleGuard()
 		delete(b.idle, run.idleKey)
 		run.idleKey = ""
 		run.behindKey, run.behindTurn, run.behindLine, run.behindMsg = "", "", "", ""
@@ -2377,7 +2383,7 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 	if !r.bridge.keepIdle(r, key, conv) {
 		return // it ended during its reply (#1667)
 	}
-	r.endIn(idleLongest)
+	r.endIdle()
 }
 
 // keepIdle leaves run waiting for the turn after the conversation key
@@ -2394,7 +2400,7 @@ func (b *subscriptionBridge) keepIdle(r *subscriptionRun, key, conv string) bool
 	r.mu.Lock()
 	closed := r.closed
 	r.mu.Unlock()
-	if closed {
+	if closed || r.idleReclaimed {
 		b.mu.Unlock()
 		return false
 	}
@@ -2417,6 +2423,8 @@ func (b *subscriptionBridge) keepIdle(r *subscriptionRun, key, conv string) bool
 		drop = append(drop, old)
 	}
 	b.idle[key] = r
+	r.stopIdleGuard()
+	r.idleGeneration++
 	r.idleKey, r.idleAt = key, time.Now()
 	if conv != "" {
 		r.convKey = conv
@@ -3211,7 +3219,7 @@ func (r *subscriptionRun) letGo() {
 	r.asked, r.shown, r.parkedAt = nil, nil, time.Time{}
 	clear(r.early)
 	r.mu.Unlock()
-	r.endIn(idleLongest)
+	r.endIdle()
 	log.Printf("claude: the turn the client gave up on was taken back; its run waits for the conversation's next turn")
 }
 
@@ -6571,6 +6579,7 @@ func (b *subscriptionBridge) removeRun(run *subscriptionRun) {
 	for _, id := range results {
 		keepLost(b.lostCalls, id, lost, 4*lostMost)
 	}
+	run.stopIdleGuard()
 	delete(b.runs, run.token)
 	if run.idleKey != "" && b.idle[run.idleKey] == run {
 		delete(b.idle, run.idleKey)

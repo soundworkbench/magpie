@@ -935,7 +935,8 @@ history to the 1h cache at 2×.
    stdin, as a user message with a uuid it is rewound to if the client gives
    up on the turn (`letGo`).
 2. `subscriptionBridge.unshelve`: the saved session of a run let go past
-   `idleMost` (`b.shelf`, at most `shelfMost`), which a new Claude Code
+   `idleMost`, memory pressure or the idle guard (`b.shelf`, at most
+   `shelfMost`), which a new Claude Code
    starts from with `--resume`, told the turn's messages alone. It is
    sent `initialize` first, which Claude Code answers only once it has
    loaded the session; one that can't load it exits 1 ("No conversation
@@ -1366,7 +1367,8 @@ Each run is two processes: Claude Code, and the MCP helper it starts for
 the caller's tools (`magpie claude-mcp-helper`, `internal/claudebridge`).
 Claude Code's parallel subagents are conversations of their own, so a
 session that starts eight has eight pairs running while they work and
-`idleMost` (6) pairs kept for an hour after. Those still waiting on tool
+`idleMost` (6) pairs kept for 30 idle minutes by default, with their
+sessions retained for an hour after the last turn. Those still waiting on tool
 calls stay for `runTimeout` (30 minutes) once their caller stops. A task
 manager names Claude Code by its version (its binary is
 `versions/2.1.311`), so on macOS Activity Monitor shows these as "2.1.311" and
@@ -1383,6 +1385,31 @@ On 10-27, a sandbox `magpie serve` with a made-up Claude sign-in and real
 Claude Code 2.1.311 against a mock API got 8 concurrent subagent-like
 requests. It kept 6 Claude Code and 6 helpers, and the list named the same
 6 pids that `ps` showed. Quitting magpie ended all 12 within a second.
+
+## Idle process reclamation
+
+[`claude_idle_guard.go`](../../internal/gateway/claude_idle_guard.go) shortens
+an idle process's life to `loadGuard.idleProcessMinutes` (30 by default).
+Both `ended` and a successful `letGo` rewind call `endIdle` after `keepIdle`.
+The early timer checks the idle table and the idle generation under the
+bridge lock, then claims the run, shelves its session and removes it from
+the table before ending the process outside the lock. A next turn that
+already took the run wins; a stale or duplicate callback cannot reclaim it
+or replace the saved session. The early timer is cancelled on reuse and
+removal. Its callback reads current settings again; turning the guard off
+or choosing at least 60 minutes leaves the original one-hour timer.
+
+The shelf keeps the original `idleAt` and `cachePrefix`, and expires at
+`idleAt + idleLongest`, not an hour after reclamation. The next turn within
+that lifetime uses `unshelve` and `--resume`, sending only new messages;
+after expiry the existing replay path applies. `ClaudeRuns.IdleFor` and
+each run's `Ends` report the effective process deadline. Settings changes
+apply when idling and when the early timer fires, without a restart.
+`TestLoadGuardIdleResume`, `TestLoadGuardIdleHotSettings` and
+`TestLoadGuardIdleStaleExpiry` use the fake Claude process and injected
+expiry times to cover saved sessions, compatibility and concurrent expiry.
+`TestLoadGuardIdleTimer` injects a short duration on its bridge and follows
+`endIdle` through the real `AfterFunc` callback to process exit and shelving.
 
 ## How large one Claude Code process may grow (`claudeRunBudget`, #3256)
 

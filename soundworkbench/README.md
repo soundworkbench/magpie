@@ -42,6 +42,10 @@
 
 改动：`internal/gateway/claude_images.go`、`claude_subscription.go`、`internal/claudetui/transcript.go` 及其测试。构建前新增 `ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved`，并测试 `./internal/claudetui/`。当前轮图片粘贴文件的路径不变。
 
+### 4. gateway: new conversations avoid overloaded remotes and idle Claude processes resume from saved sessions
+
+The local `loadGuard` settings expose memory through `/v1/magpie/load`, defer overloaded remotes for new conversations, and reclaim idle Claude Code processes after 30 minutes while keeping their sessions for an hour. Existing session, turn and cache affinity stays on its answerer. `loadGuard.off` restores the previous behavior. The build checks include `LoadGuard` tests in settings, settingsapi, provider and gateway.
+
 ### 是否提给上游
 
 这些补丁尚未提给上游。上游只接受协作者的 PR，社区的修复以 issue 的形式提交（见 `docs/contributors.md`）。补丁 1 修的是上游调度里一个可复现的不一致，适合附补丁提 issue；补丁 2 依赖 ChatGPT 后端的 open 接口，上游是否接受待确认。上游合入同等修复后，在下一次变基时丢掉我们的那个提交。
@@ -87,7 +91,7 @@ soundworkbench/build.sh <提交>     # 从指定提交构建
 脚本做三件事：
 
 1. 用 `git archive` 取出这个提交的源码，工作树里没提交的改动不进镜像。
-2. 在 `golang:1.26-alpine` 里跑补丁的测试：`RemoteAllowance|WebFetch|FetchVerification|CodexFetchText|ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved`（`./internal/provider/`、`./internal/gateway/`、`./internal/claudetui/`）。不过就停，退出码 3。
+2. 在 `golang:1.26-alpine` 里跑补丁的测试：`LoadGuard|RemoteAllowance|WebFetch|FetchVerification|CodexFetchText|ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved`（`./internal/settings/`、`./internal/settingsapi/`、`./internal/provider/`、`./internal/gateway/`、`./internal/claudetui/`）。不过就停，退出码 3。
 3. 构建镜像，打两个标签，打印版本。
 
 版本号规则：

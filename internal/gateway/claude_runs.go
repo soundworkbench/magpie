@@ -76,7 +76,7 @@ func (b *subscriptionBridge) claudeRunList() ClaudeRuns {
 		all = append(all, s)
 	}
 	b.mu.Unlock()
-	out := ClaudeRuns{Object: "claude-runs", Runs: []ClaudeRun{}, IdleMost: idleMost, IdleFor: idleLongest}
+	out := ClaudeRuns{Object: "claude-runs", Runs: []ClaudeRun{}, IdleMost: idleMost, IdleFor: idleProcessFor()}
 	for _, s := range all {
 		r := s.run
 		r.mu.Lock()

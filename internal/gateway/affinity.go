@@ -41,6 +41,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 )
 
@@ -150,6 +151,9 @@ type stick struct {
 	// on after one that had: a stand-in, given back at a new turn once a
 	// member ahead is ready (backFromStandIn). Kept on disk too
 	stoodIn bool
+	// loadChosen remembers a seat chosen only by load deferral, including
+	// after a restart. A real failure can still make this a stand-in.
+	loadChosen bool
 }
 
 // hourCache is the part of a conversation's prompt the vendor said it keeps
@@ -281,7 +285,8 @@ type savedStick struct {
 	CacheHourAt time.Time `json:"cacheHourAt,omitzero"`
 	// StoodIn is its stoodIn, absent from a file written before it was
 	// kept: such a stick is no stand-in, kept by its cache as it was
-	StoodIn bool `json:"stoodIn,omitempty"`
+	StoodIn    bool `json:"stoodIn,omitempty"`
+	LoadChosen bool `json:"loadChosen,omitempty"`
 }
 
 func sticksPath() string { return filepath.Join(filepath.Dir(provider.Path()), "affinity.json") }
@@ -315,7 +320,7 @@ func stickOf(key string) (stick, bool) {
 			continue
 		}
 		sticks.m[k] = stick{rest: v.Rest, who: v.Who, model: v.Model, effort: v.Effort, turn: v.Turn, at: v.At, cacheRead: v.CacheRead, cacheWrite: v.CacheWrite,
-			hour: hourCache{tokens: v.CacheHour, at: v.CacheHourAt}, stoodIn: v.StoodIn}
+			hour: hourCache{tokens: v.CacheHour, at: v.CacheHourAt}, stoodIn: v.StoodIn, loadChosen: v.LoadChosen}
 	}
 	st, ok := sticks.m[key]
 	return st, ok
@@ -340,7 +345,7 @@ func saveSticks() {
 	sticks.Lock()
 	for k, st := range sticks.m {
 		if now.Sub(st.at) <= stickKeep {
-			ks = append(ks, kept{k, savedStick{st.rest, st.who, st.model, st.effort, st.turn, st.at, st.cacheRead, st.cacheWrite, st.hour.tokens, st.hour.at, st.stoodIn}})
+			ks = append(ks, kept{k, savedStick{st.rest, st.who, st.model, st.effort, st.turn, st.at, st.cacheRead, st.cacheWrite, st.hour.tokens, st.hour.at, st.stoodIn, st.loadChosen}})
 		}
 	}
 	sticks.Unlock()
@@ -572,12 +577,27 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 			}
 		}
 	}
+	// A load seat becomes an ordinary backup once an earlier candidate
+	// actually fails. Forget its load exemption, including for fallbacks
+	// whose candidates have no group place for standsInFor to remember.
+	if st.loadChosen && at >= 0 && at < len(pl.order) {
+		for i, w := range pl.order {
+			if i < len(cs) && cs[i].loadOrder < cs[at].loadOrder && (w.Rest != nil || w.CreditsLast || w.Busy > 0) {
+				st.loadChosen = false
+				break
+			}
+		}
+	}
+	// Only a reversal caused by load keeps the former answerer in place.
+	// A real stand-in still returns when its main recovers, even if loaded.
+	loadKeeps := !settings.LoadGuardNow().Off && at >= 0 && at < len(pl.order) && len(pl.order) > 0 &&
+		(st.loadChosen && !st.stoodIn || pl.order[at].Loaded != "" && cs[at].loadOrder < cs[0].loadOrder)
 	switch {
 	case mode == provider.AffinityOff:
 		a.Why = "off"
 	case !had:
 		a.Why = "first"
-	case at < 0:
+	case at < 0 || at >= len(pl.order):
 		a.Why = "gone"
 	case mode == provider.AffinityStrict:
 		// whatever it is — resting, all but used up, past its cap
@@ -610,7 +630,7 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		// wait in the vendor's queue (axelburks on Discord). Within a
 		// turn it stays, on the reasoning it sealed for the tool loop
 		a.Why = "busy"
-	case !a.Within && backToMain(pl.order, at):
+	case !a.Within && !loadKeeps && backToMain(pl.order, at):
 		// a provider's fallback is its emergency path, not a place a
 		// conversation stays: once one of the provider's own keys or
 		// accounts is ready again (its rest over, its quota back) the
@@ -620,7 +640,7 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		// for it, which the provider can't read, and the whole prompt is
 		// sent afresh to the provider at the next turn all the same
 		a.Why = "main"
-	case !a.Within && inOrder && mode == "" && backToFirst(cs, pl.order, at, !strings.HasPrefix(scope, provider.GroupPrefix)) && (strings.HasPrefix(scope, provider.GroupPrefix) || cacheHolds(st, cs[at].p)):
+	case !a.Within && !loadKeeps && inOrder && mode == "" && backToFirst(cs, pl.order, at, !strings.HasPrefix(scope, provider.GroupPrefix)) && (strings.HasPrefix(scope, provider.GroupPrefix) || cacheHolds(st, cs[at].p)):
 		// a group set to In order tries its members in the order the user
 		// put them in: a conversation that went to a later member while
 		// the first couldn't take it (a 429, a 5xx, a rest) goes back to
@@ -650,7 +670,7 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		// its cache as before; within a turn it stays, and Stays:
 		// Session or Strict, the user's own, keep it where it is
 		a.Why = "back"
-	case at > 0 && pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing) && !pl.order[at].CreditsFirst:
+	case at > 0 && pl.order[at].Loaded == "" && pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing) && !pl.order[at].CreditsFirst:
 		// all but used up, and put behind another: first still — the
 		// one key or account it has (#1016), or every one used up — it
 		// doesn't move
@@ -709,6 +729,16 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 	}
 	if !rotate {
 		cs, pl = withSession(scope, key, sessionNamed(in), a, st, had, cs, pl)
+	}
+	// A load mark describes a new seat, never a transient order seen by a
+	// kept conversation. Carry the previous mark only while it keeps its seat.
+	newSeat := a.Why == "first" || a.Why == "gone" || a.Why == "no-cache" || a.Why == "cold"
+	for i := range cs {
+		if newSeat {
+			cs[i].loadChosen = i == 0 && cs[i].loadChosen
+		} else {
+			cs[i].loadChosen = a.Kept && i == 0 && st.loadChosen && !st.stoodIn
+		}
 	}
 	return cs, pl, a, key
 }
@@ -846,7 +876,7 @@ func leastHeld(scope, key string, cs []candidate, pl planned, ready bool) ([]can
 	seat := func(c candidate) string { return c.who() + "/" + provider.WithMemberEffort(c.model, c.effort) }
 	best := -1
 	for i, c := range cs {
-		if pl.order[i].Rest != nil || pl.order[i].Aside || standsIn(pl.order, i) || lastBehind(pl.order, i) || busyBehind(pl.order, i) || ready && i > 0 && !readyForNew(pl.order, i) {
+		if pl.order[i].Rest != nil || pl.order[i].Aside || standsIn(pl.order, i) || lastBehind(pl.order, i) || pl.order[i].Loaded != "" || busyBehind(pl.order, i) || ready && i > 0 && !readyForNew(pl.order, i) {
 			continue
 		}
 		if best < 0 || held[seat(c)] < held[seat(cs[best])] {
@@ -874,7 +904,7 @@ func leastHeld(scope, key string, cs []candidate, pl planned, ready bool) ([]can
 // with those that have room (Weighed.WeekLow).
 func readyForNew(order []Weighed, i int) bool {
 	w := order[i]
-	return w.Rest == nil && !w.Aside && !standsIn(order, i) && !(w.Known && w.Used >= lowShare && !w.CreditsFirst && !(w.WeekLow && w.Used < usedShare)) && !lastBehind(order, i) && !busyBehind(order, i)
+	return w.Loaded == "" && w.Rest == nil && !w.Aside && !standsIn(order, i) && !(w.Known && w.Used >= lowShare && !w.CreditsFirst && !(w.WeekLow && w.Used < usedShare)) && !lastBehind(order, i) && !busyBehind(order, i)
 }
 
 // standsIn says whether order[i] is a provider's fallback while one of the
@@ -1050,9 +1080,18 @@ func spreadsSessions(mode, routing string) bool {
 // after puts first the one after cs[at], round from the end, that isn't
 // resting, nor a fallback while the provider's own leads (standsIn).
 func after(cs []candidate, pl planned, at int) ([]candidate, planned) {
+	// Keep rotating if every eligible candidate is loaded. Look once, so
+	// walking a fully loaded group remains linear in the number of members.
+	unloaded := false
+	for i, w := range pl.order {
+		if w.Loaded == "" && w.Rest == nil && !w.Aside && !standsIn(pl.order, i) && !lastBehind(pl.order, i) && !busyBehind(pl.order, i) {
+			unloaded = true
+			break
+		}
+	}
 	for d := 1; d < len(cs); d++ {
 		i := (at + d) % len(cs)
-		if pl.order[i].Rest != nil || pl.order[i].Aside || standsIn(pl.order, i) || lastBehind(pl.order, i) || busyBehind(pl.order, i) {
+		if pl.order[i].Rest != nil || pl.order[i].Aside || standsIn(pl.order, i) || lastBehind(pl.order, i) || busyBehind(pl.order, i) || unloaded && pl.order[i].Loaded != "" {
 			continue // a turn goes round the keys routed over only
 		}
 		if i > 0 {
@@ -1089,6 +1128,7 @@ func answeredStanding(key string, c candidate, turn int, u Usage, stoodIn bool) 
 	now := time.Now()
 	sticks.Lock()
 	var hour hourCache
+	loadChosen := c.loadChosen
 	if st, ok := sticks.m[key]; ok && st.who == c.who() && st.model == c.model {
 		hour = st.hour // a cache is the account's, of the model
 		// a stand-in that answers the conversation on is a stand-in
@@ -1096,8 +1136,9 @@ func answeredStanding(key string, c candidate, turn int, u Usage, stoodIn bool) 
 		// meanwhile by routing, is given it once routing puts it first
 		stoodIn = stoodIn || st.stoodIn
 	}
+	loadChosen = loadChosen && !stoodIn
 	hour = hour.after(u, now)
-	sticks.m[key] = stick{rest: c.rest, who: c.who(), model: c.model, effort: c.effort, turn: turn, at: now, cacheRead: cacheRead, cacheWrite: cacheWrite, hour: hour, stoodIn: stoodIn}
+	sticks.m[key] = stick{rest: c.rest, who: c.who(), model: c.model, effort: c.effort, turn: turn, at: now, cacheRead: cacheRead, cacheWrite: cacheWrite, hour: hour, stoodIn: stoodIn, loadChosen: loadChosen}
 	delete(sticks.opening, key)
 	if len(sticks.m) > 4096 {
 		for k, st := range sticks.m {

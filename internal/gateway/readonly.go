@@ -34,6 +34,7 @@ var readOnlyRoutes = map[string]bool{
 	"GET " + StatuslinePath:           true,
 	"POST " + StatuslinePath:          true,
 	"GET " + provider.RemoteCardsPath: true,
+	"GET " + provider.RemoteLoadPath:  true,
 	"GET /v1/magpie/usage":            true,
 	"GET /v1/magpie/usage/requests":   true,
 	"GET /v1/magpie/limit":            true,

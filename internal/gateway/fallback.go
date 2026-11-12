@@ -48,10 +48,15 @@ const fallbackCooldown = time.Minute
 // for the client hanging up first (#5113). A var for tests.
 var groupBudget = 540 * time.Second
 
+var remoteLoad = provider.RemoteLoad
+
 type candidate struct {
-	p     provider.Provider
-	model string
-	rest  string // what rests after a failure: the provider, or one of its keys
+	// loadChosen keeps a conversation put here by load deferral here after recovery.
+	loadChosen bool
+	loadOrder  int // position before load deferral, for affinity recovery
+	p          provider.Provider
+	model      string
+	rest       string // what rests after a failure: the provider, or one of its keys
 	// effort is the reasoning the group's member it is of is fixed at
 	// ("provider/model:low"); "" for one that follows the agent or the group
 	effort string
@@ -1233,9 +1238,12 @@ func asideOf(cs []candidate, q provider.Provider, fallback bool, from provider.P
 // them (creditsLast) behind both, those in their own order. Ahead of the
 // resting, a model its plugin says is busier than the user's
 // settings.BusyLoad (busyOf) goes behind the ready ones: it answers, only
-// after a wait in its vendor's queue (axelburks on Discord).
+// after a wait in its vendor's queue (axelburks on Discord). Loaded remotes
+// follow busy models, ahead of resting ones; affinity may keep a conversation
+// on one regardless of its memory reading.
 func restLast(out []candidate, pl planned) ([]candidate, planned) {
 	if len(out) == 1 {
+		pl.order[0].Loaded = loadedOf(out[0], settings.LoadGuardNow())
 		if r, ok := restingOf(out[0]); ok {
 			pl.order[0].Rest = &r // tried all the same: there is no other
 		}
@@ -1244,9 +1252,15 @@ func restLast(out []candidate, pl planned) ([]candidate, planned) {
 	}
 	now := time.Now()
 	over := settings.Shared().BusyLoad
-	var ready, busy, resting, last []candidate
-	var wReady, wBusy, wResting, wLast []Weighed
-	for i, c := range out {
+	guard := settings.LoadGuardNow()
+	deferred := false
+	var ready, busy, loaded, resting, last []candidate
+	var wReady, wBusy, wLoaded, wResting, wLast []Weighed
+	for i := range out {
+		out[i].loadOrder = i
+		c := out[i]
+		c.loadChosen = false
+		pl.order[i].Loaded = loadedOf(c, guard)
 		r, isResting := restingOf(c)
 		if isResting {
 			pl.order[i].Rest = &r
@@ -1261,12 +1275,20 @@ func restLast(out []candidate, pl planned) ([]candidate, planned) {
 		case isBusy:
 			pl.order[i].Busy = load
 			busy, wBusy = append(busy, c), append(wBusy, pl.order[i])
+		case pl.order[i].Loaded != "":
+			// Only load deferral from the ready bucket can seat a later
+			// conversation. Failures, busy models and held reserves cannot.
+			if !pl.order[i].Aside && pl.order[i].Reserve == 0 {
+				deferred = true
+			}
+			loaded, wLoaded = append(loaded, c), append(wLoaded, pl.order[i])
 		default:
+			c.loadChosen = deferred && !pl.order[i].Aside && pl.order[i].Reserve == 0
 			ready, wReady = append(ready, c), append(wReady, pl.order[i])
 		}
 	}
-	pl.order = append(append(append(wReady, wBusy...), wResting...), wLast...)
-	return append(append(append(ready, busy...), resting...), last...), pl
+	pl.order = append(append(append(append(wReady, wBusy...), wLoaded...), wResting...), wLast...)
+	return append(append(append(append(ready, busy...), loaded...), resting...), last...), pl
 }
 
 // busyOf is the load c's plugin last reported for its model, and whether
@@ -4744,4 +4766,17 @@ func askUnlisted(order, left []Weighed, c candidate, ws []Weighed) ([]Weighed, [
 		return append(slices.Clip(order), ws...), left
 	}
 	return slices.Concat(order[:at+1], ws, order[at+1:]), left
+}
+
+// loadedOf never waits for a remote. Unknown memory leaves routing alone.
+func loadedOf(c candidate, g settings.LoadGuardConfig) string {
+	if g.Off {
+		return ""
+	}
+	r, ok := remoteLoad(c.p)
+	if !ok {
+		return ""
+	}
+	_, why := provider.Overloaded(r, g)
+	return why
 }
