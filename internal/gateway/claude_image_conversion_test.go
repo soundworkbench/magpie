@@ -7,17 +7,21 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"image/png"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/image/bmp"
 	"golang.org/x/image/tiff"
@@ -230,11 +234,11 @@ func TestClaudeImageDecodeBudget(t *testing.T) {
 	budget.release(capacity/2 + 1)
 	t.Log("two half-capacity acquires succeeded; the third waited and woke on release")
 
-	// The same budget must cover every decoder, even an image kept as-is.
-	oldWait := claudeImageConvertWait
-	claudeImageConvertWait = 200 * time.Millisecond
-	t.Cleanup(func() { claudeImageConvertWait = oldWait })
-	for _, format := range []string{"bmp", "png", "jpeg", "gif", "webp"} {
+	// PNG, JPEG and BMP still decode even when the dimensions fit.
+	oldWait, oldBusy := claudeImageConvertWait, claudeImageBusyWait
+	claudeImageConvertWait, claudeImageBusyWait = 300*time.Millisecond, 30*time.Millisecond
+	t.Cleanup(func() { claudeImageConvertWait, claudeImageBusyWait = oldWait, oldBusy })
+	for _, format := range []string{"bmp", "png", "jpeg"} {
 		t.Run(format, func(t *testing.T) {
 			if !claudeImageDecodeBudget.acquire(capacity, time.Second) {
 				t.Fatal("decode budget was not empty")
@@ -250,6 +254,9 @@ func TestClaudeImageDecodeBudget(t *testing.T) {
 			encoded := base64.StdEncoding.EncodeToString(raw)
 			key := claudeImageClearFixture(t, declared, encoded)
 			logs := keepLog(t)
+			claudeImageDecodeBudget.mu.Lock()
+			claudeImageDecodeBudget.gaveUp = time.Time{}
+			claudeImageDecodeBudget.mu.Unlock()
 			start := time.Now()
 			mt, data, note := claudeImage(declared, encoded)
 			elapsed := time.Since(start)
@@ -278,6 +285,16 @@ func TestClaudeImageDecodeBudget(t *testing.T) {
 			if record.action != "note" || record.found != declared || record.bytes != len(raw) || record.hash != fmt.Sprintf("%x", sum[:4]) {
 				t.Errorf("busy record lost its action, type, bytes or hash: %+v", record)
 			}
+			if elapsed < claudeImageConvertWait {
+				t.Error("first image did not wait the full interval")
+			}
+			start = time.Now()
+			_, _, secondNote := claudeImage(declared, encoded)
+			short := time.Since(start)
+			t.Logf("second busy image waited %s", short)
+			if secondNote != claudeImageOmittedBusy || short < claudeImageBusyWait || short >= claudeImageConvertWait {
+				t.Error("give-up did not shorten the next wait")
+			}
 			claudeImageDecodeBudget.release(capacity)
 			held = false
 			mt, data, note = claudeImage(declared, encoded)
@@ -296,21 +313,14 @@ func TestClaudeImageDecodeBudget(t *testing.T) {
 		})
 	}
 	cfg := image.Config{Width: 8000, Height: 8000, ColorModel: color.RGBAModel}
-	holds, _ := claudeImageHolds(cfg, "png", nil)
+	holds, _ := claudeImageHolds(cfg, "png", claudeImagePNGHeader(cfg.Width, cfg.Height, 8, 6, 0))
 	weight := claudeImageDecodeWeight(cfg, holds, true)
-	if weight != capacity || !budget.acquire(weight, time.Second) {
-		t.Fatalf("over-capacity refit weight %d, want %d and a successful acquire", weight, capacity)
+	if weight <= capacity || budget.acquire(weight, time.Second) {
+		t.Fatalf("over-capacity weight %d was admitted", weight)
 	}
-	budget.mu.Lock()
-	used := budget.used
-	budget.mu.Unlock()
-	budget.release(weight)
-	if used != capacity || budget.used != 0 {
-		t.Errorf("over-capacity image held %d then left %d", used, budget.used)
-	}
-	t.Logf("over-capacity refit acquired %d bytes; released budget has %d used", used, budget.used)
+	t.Logf("over-capacity refit weight %d rejected; used %d", weight, budget.used)
 	claudeImageDecodeBudget.mu.Lock()
-	used = claudeImageDecodeBudget.used
+	used := claudeImageDecodeBudget.used
 	claudeImageDecodeBudget.mu.Unlock()
 	if used != 0 {
 		t.Errorf("shared budget left %d bytes used", used)
@@ -398,9 +408,9 @@ func TestClaudeImageProgressiveJPEGCountsCoefficients(t *testing.T) {
 			}
 			holds, ok := claudeImageHolds(cfg, format, raw)
 			base, _ := imageHolds(cfg, format)
-			want := base
+			want := 128<<10 + 3*8000*10000
 			if marker == 0xc2 {
-				want = min(8000*10000*(4+12), holdsMost)
+				want = min(128<<10+8000*10000*(3+12), holdsMost)
 			}
 			if !ok || holds != want {
 				t.Errorf("holds %d, valid %t; want %d", holds, ok, want)
@@ -412,8 +422,8 @@ func TestClaudeImageProgressiveJPEGCountsCoefficients(t *testing.T) {
 			// A smaller header also checks the component multiplier below the cap.
 			small := cfg
 			small.Width, small.Height = 800, 1000
-			if n, _ := claudeImageHolds(small, format, raw); n != 800*1000*(4+12) {
-				t.Errorf("uncapped holds %d, want %d", n, 800*1000*(4+12))
+			if n, _ := claudeImageHolds(small, format, raw); n != 128<<10+800*1000*(3+12) {
+				t.Errorf("uncapped holds %d, want %d", n, 128<<10+800*1000*(3+12))
 			}
 			encoded := base64.StdEncoding.EncodeToString(raw)
 			claudeImageClearFixture(t, "image/jpeg", encoded)
@@ -424,7 +434,7 @@ func TestClaudeImageProgressiveJPEGCountsCoefficients(t *testing.T) {
 			runtime.ReadMemStats(&after)
 			allocated := after.TotalAlloc - before.TotalAlloc
 			t.Logf("allocated %d bytes; type %q, image %t, note %q; %s", allocated, mt, data != "", note, strings.TrimSpace(logs.String()))
-			if mt != "" || data != "" || note != claudeImageOmitted || !strings.Contains(logs.String(), "image exceeds the decode limit") {
+			if mt != "" || data != "" || note != claudeImageOmitted || !strings.Contains(logs.String(), "image too large to convert") {
 				t.Error("progressive JPEG was not refused for its decode cost")
 			}
 			if allocated >= 8<<20 {
@@ -639,5 +649,433 @@ func TestClaudeImageRecordLimitsHeaderRead(t *testing.T) {
 				t.Errorf("dimensions %dx%d, want %dx%d", record.width, record.height, tc.width, tc.height)
 			}
 		})
+	}
+}
+
+func claudeImageChunk(kind string, data []byte) []byte {
+	b := append([]byte(kind), make([]byte, 4)...)
+	binary.LittleEndian.PutUint32(b[4:], uint32(len(data)))
+	b = append(b, data...)
+	if len(data)%2 != 0 {
+		b = append(b, 0)
+	}
+	return b
+}
+
+func claudeImageRIFF(chunks ...[]byte) []byte {
+	b := []byte("WEBP")
+	for _, chunk := range chunks {
+		b = append(b, chunk...)
+	}
+	return claudeImageChunk("RIFF", b)
+}
+
+func TestClaudeImageWebPLeadingChunk(t *testing.T) {
+	frame := append([]byte(nil), replayImage(t, "webp")[12:]...)
+	binary.LittleEndian.PutUint32(frame[9:13], 4095|4095<<14)
+	canvas := claudeImageChunk("VP8X", make([]byte, 10))
+	for _, tc := range []struct {
+		name, reason string
+		raw          []byte
+	}{
+		{"leading VP8Z", "unsupported WebP layout", claudeImageRIFF(claudeImageChunk("VP8Z", nil), canvas, frame)},
+		{"skipped odd JUNK", "WebP frame does not match its canvas", claudeImageRIFF(canvas, claudeImageChunk("JUNK", []byte{1}), frame)},
+		{"missing frame", "WebP frame does not match its canvas", claudeImageRIFF(canvas, claudeImageChunk("ANMF", frame))},
+		{"short frame", "WebP frame does not match its canvas", claudeImageRIFF(canvas, claudeImageChunk("VP8L", []byte{0x2f}))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded := base64.StdEncoding.EncodeToString(tc.raw)
+			key := claudeImageClearFixture(t, "image/webp", encoded)
+			logs := keepLog(t)
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			mt, data, note := claudeImage("image/webp", encoded)
+			runtime.ReadMemStats(&after)
+			n := after.TotalAlloc - before.TotalAlloc
+			t.Logf("allocated %d; type %q note %q; %s", n, mt, note, strings.TrimSpace(logs.String()))
+			if n >= 8<<20 {
+				t.Errorf("allocated %d, want <8 MiB", n)
+			}
+			if mt != "" || data != "" || note != claudeImageOmitted || !strings.Contains(logs.String(), tc.reason) {
+				t.Error("unsafe layout did not receive its cached note")
+			}
+			if _, ok := fitted.get(key); !ok {
+				t.Error("verdict not cached")
+			}
+		})
+	}
+}
+
+type claudeImageBits struct {
+	data []byte
+	n    uint
+}
+
+func (b *claudeImageBits) put(v uint32, n uint) {
+	for i := uint(0); i < n; i++ {
+		if b.n%8 == 0 {
+			b.data = append(b.data, 0)
+		}
+		b.data[b.n/8] |= byte(v>>i&1) << (b.n % 8)
+		b.n++
+	}
+}
+func (b *claudeImageBits) single(v uint32) {
+	b.put(1, 1)
+	b.put(0, 1)
+	b.put(1, 1)
+	b.put(v, 8)
+}
+
+// A constant lossless image needs no pixel bits: each channel's tree has
+// one symbol. The optional meta image selects group 16383, then EOF ends
+// the main groups. Old decoders allocate about 42 MiB before that EOF.
+func claudeImageLossless(w, h int, meta bool) []byte {
+	b := claudeImageBits{}
+	b.put(0x2f, 8)
+	b.put(uint32(w-1), 14)
+	b.put(uint32(h-1), 14)
+	b.put(0, 4)
+	b.put(0, 1) // transforms
+	b.put(0, 1) // colour cache
+	if meta {
+		b.put(1, 1)
+		b.put(0, 3)
+		b.put(0, 1)
+		for _, v := range []uint32{255, 63, 0, 255, 0} {
+			b.single(v)
+		}
+	} else {
+		b.put(0, 1)
+		for _, v := range []uint32{0, 0, 0, 255, 0} {
+			b.single(v)
+		}
+	}
+	return b.data
+}
+
+func TestClaudeImageWebPNoRefitIsNotDecoded(t *testing.T) {
+	raw := claudeImageRIFF(claudeImageChunk("VP8L", claudeImageLossless(1, 1, true)))
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	claudeImageClearFixture(t, "image/webp", encoded)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	mt, data, note := claudeImage("image/webp", encoded)
+	runtime.ReadMemStats(&after)
+	n := after.TotalAlloc - before.TotalAlloc
+	t.Logf("free budget: allocated %d, type %q, unchanged %t, note %q", n, mt, data == encoded, note)
+	if mt != "image/webp" || data != encoded || note != "" || n >= 8<<20 {
+		t.Error("complete WebP decoded or took the budget")
+	}
+	claudeImageClearFixture(t, "image/webp", encoded)
+	// An occupied budget must not turn this complete small image into a busy note.
+	if !claudeImageDecodeBudget.acquire(codexImageMaxBytes, time.Second) {
+		t.Fatal("budget not empty")
+	}
+	defer claudeImageDecodeBudget.release(codexImageMaxBytes)
+	mt, data, note = claudeImage("image/webp", encoded)
+	if mt != "image/webp" || data != encoded || note != "" {
+		t.Error("complete WebP took the occupied budget")
+	}
+
+}
+
+func claudeImagePNGHeader(w, h int, depth, kind, interlace byte) []byte {
+	b := make([]byte, 13)
+	binary.BigEndian.PutUint32(b, uint32(w))
+	binary.BigEndian.PutUint32(b[4:], uint32(h))
+	b[8], b[9], b[12] = depth, kind, interlace
+	return append([]byte("\x89PNG\r\n\x1a\n"), claudeImagePNGChunk("IHDR", b)...)
+}
+func claudeImagePNGChunk(kind string, b []byte) []byte {
+	out := binary.BigEndian.AppendUint32(nil, uint32(len(b)))
+	out = append(out, kind...)
+	out = append(out, b...)
+	return binary.BigEndian.AppendUint32(out, crc32.ChecksumIEEE(out[4:]))
+}
+func claudeImagePNG(t *testing.T, w, h int, depth, kind, interlace byte, transparent bool) []byte {
+	t.Helper()
+	out := claudeImagePNGHeader(w, h, depth, kind, interlace)
+	if transparent {
+		out = append(out, claudeImagePNGChunk("tRNS", []byte{0, 0})...)
+	}
+	bpp := int(depth) / 8
+	if kind == 6 {
+		bpp *= 4
+	}
+	var data bytes.Buffer
+	z := zlib.NewWriter(&data)
+	passes := [][4]int{{0, 0, 1, 1}}
+	if interlace != 0 {
+		passes = [][4]int{{0, 0, 8, 8}, {4, 0, 8, 8}, {0, 4, 4, 8}, {2, 0, 4, 4}, {0, 2, 2, 4}, {1, 0, 2, 2}, {0, 1, 1, 2}}
+	}
+	for _, p := range passes {
+		pw, ph := (w-p[0]+p[2]-1)/p[2], (h-p[1]+p[3]-1)/p[3]
+		if pw <= 0 || ph <= 0 {
+			continue
+		}
+		row := make([]byte, 1+pw*bpp)
+		for range ph {
+			if _, err := z.Write(row); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out = append(out, claudeImagePNGChunk("IDAT", data.Bytes())...)
+	return append(out, claudeImagePNGChunk("IEND", nil)...)
+}
+
+func TestClaudeImageOverCapacityIsNoted(t *testing.T) {
+	raw := append(claudeImagePNGHeader(18000, 18000, 8, 0, 0), claudeImagePNGChunk("IEND", nil)...)
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	key := claudeImageClearFixture(t, "image/png", encoded)
+	logs := keepLog(t)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	mt, data, note := claudeImage("image/png", encoded)
+	runtime.ReadMemStats(&after)
+	n := after.TotalAlloc - before.TotalAlloc
+	t.Logf("allocated %d; type %q, note %q; %s", n, mt, note, strings.TrimSpace(logs.String()))
+	if mt != "" || data != "" || note != claudeImageOmitted || !strings.Contains(logs.String(), "image too large to convert") || n >= 8<<20 {
+		t.Error("over-capacity conversion was not refused before decode")
+	}
+	if _, ok := fitted.get(key); !ok {
+		t.Error("refusal not cached")
+	}
+}
+
+func TestClaudeImageHoldsHuffmanLayout(t *testing.T) {
+	// The unexported x/image/vp8l hNode, hTree and hGroup layouts from
+	// huffman.go and decode.go, including the compiled slice header.
+	type node struct {
+		symbol   uint32
+		children int32
+	}
+	type tree struct {
+		nodes []node
+		lut   [128]uint32
+	}
+	type group [5]tree
+	size := unsafe.Sizeof(group{})
+	t.Logf("compiled hGroup = %d bytes; bound = %d", size, claudeImageHGroupBytes)
+	if size > claudeImageHGroupBytes || unsafe.Sizeof(uintptr(0)) == 8 && size != claudeImageHGroupBytes {
+		t.Fatal("Huffman group layout changed")
+	}
+	// Also measure the actual compiled decoder: the local layout above must
+	// not silently stop matching x/image's unexported group type. This tiny
+	// stream allocates 16384 groups and then fails before allocating pixels.
+	raw := claudeImageRIFF(claudeImageChunk("VP8L", claudeImageLossless(1, 1, true)))
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, _, err := image.Decode(bytes.NewReader(raw))
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	groups := 16384 * uint64(size)
+	t.Logf("compiled decoder allocated %d; group storage %d", allocated, groups)
+	if err == nil || allocated < groups || allocated > groups+128<<10 {
+		t.Fatal("compiled decoder no longer matches the pinned group layout")
+	}
+
+}
+
+func TestClaudeImageHoldsBound(t *testing.T) {
+	fixtures := []struct {
+		name string
+		raw  []byte
+	}{
+		{"grey PNG", claudeImagePNG(t, 300, 200, 8, 0, 0, false)},
+		{"grey PNG tRNS", claudeImagePNG(t, 300, 200, 8, 0, 0, true)},
+		{"grey16 PNG tRNS", claudeImagePNG(t, 300, 200, 16, 0, 0, true)},
+		{"interlaced RGBA PNG", claudeImagePNG(t, 300, 200, 8, 6, 1, false)},
+		{"lossless WebP", claudeImageRIFF(claudeImageChunk("VP8L", claudeImageLossless(300, 200, false)))},
+		{"BMP", claudeImageGray(t, "bmp", 300, 200)},
+		{"GIF", replayImage(t, "gif")},
+	}
+	// Go's decoder regression corpus supplies colour spaces and progressive
+	// scans that its JPEG encoder cannot produce. These are real small images.
+	for _, name := range []string{"video-001.q50.420.jpeg", "video-001.q50.444.jpeg", "video-001.rgb.jpeg", "video-001.cmyk.jpeg", "video-001.progressive.jpeg"} {
+		raw, err := os.ReadFile(filepath.Join(runtime.GOROOT(), "src", "image", "testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixtures = append(fixtures, struct {
+			name string
+			raw  []byte
+		}{name, raw})
+	}
+	fixtures = append(fixtures, struct {
+		name string
+		raw  []byte
+	}{"lossy WebP VP8L alpha", claudeImageAlphaWebP(t)})
+	for _, tc := range fixtures {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, format, err := image.DecodeConfig(bytes.NewReader(tc.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			holds, ok := claudeImageHolds(cfg, format, tc.raw)
+			if !ok {
+				t.Fatal("no holds")
+			}
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			im, _, err := image.Decode(bytes.NewReader(tc.raw))
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := after.TotalAlloc - before.TotalAlloc
+			t.Logf("%dx%d %T: TotalAlloc %d <= holds %d", cfg.Width, cfg.Height, im, n, holds)
+			if n > uint64(holds) {
+				t.Errorf("allocation %d exceeds holds %d", n, holds)
+			}
+		})
+	}
+}
+
+func claudeImageJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	im := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	// Spatial noise at quality 85 gives a phone-sized file, not just a header.
+	v := uint32(1)
+	for i := range im.Y {
+		v ^= v << 13
+		v ^= v >> 17
+		v ^= v << 5
+		im.Y[i] = 112 + byte(v&31)
+	}
+	for i := range im.Cb {
+		im.Cb[i], im.Cr[i] = 128, 128
+	}
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, im, &jpeg.Options{Quality: 85}); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func TestClaudeImageRefitWeightBound(t *testing.T) {
+	for _, tc := range []struct {
+		format string
+		w, h   int
+	}{{"png", 2001, 2001}, {"jpeg", 2600, 1800}, {"jpeg", 4032, 3024}, {"bmp", 1, 2073600}} {
+		t.Run(fmt.Sprintf("%s/%dx%d", tc.format, tc.w, tc.h), func(t *testing.T) {
+			var raw []byte
+			switch tc.format {
+			case "png":
+				raw = claudeImagePNG(t, tc.w, tc.h, 8, 6, 0, false)
+			case "jpeg":
+				raw = claudeImageJPEG(t, tc.w, tc.h)
+			case "bmp":
+				raw = claudeImageGray(t, "bmp", tc.w, tc.h)
+			}
+			cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			holds, ok := claudeImageHolds(cfg, format, raw)
+			if !ok {
+				t.Fatal("no holds")
+			}
+			weight := claudeImageDecodeWeight(cfg, holds, true)
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			src, _, err := image.Decode(bytes.NewReader(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			e := claudeImageRefit(src, cfg, format)
+			runtime.ReadMemStats(&after)
+			n := after.TotalAlloc - before.TotalAlloc
+			t.Logf("input %d, holds %d, weight %d, TotalAlloc %d; two fit = %t; result %s", len(raw), holds, weight, n, 2*weight <= codexImageMaxBytes, e.mime)
+			if n > uint64(weight) || len(e.data) == 0 {
+				t.Error("refit allocation exceeds weight or no output")
+			}
+			if tc.format != "bmp" && weight >= codexImageMaxBytes {
+				t.Error("ordinary image exceeds capacity")
+			}
+			if tc.w == 4032 {
+				encoded := base64.StdEncoding.EncodeToString(raw)
+				claudeImageClearFixture(t, "image/jpeg", encoded)
+				mt, data, note := claudeImage("image/jpeg", encoded)
+				if mt != "image/jpeg" || data == encoded || data == "" || note != "" {
+					t.Errorf("phone photo: type %q, unchanged %t, note %q", mt, data == encoded, note)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeImageEncodeBounded(t *testing.T) {
+	im := image.NewRGBA(image.Rect(0, 0, 2000, 2000))
+	v := uint32(1)
+	for i := range im.Pix {
+		v ^= v << 13
+		v ^= v >> 17
+		v ^= v << 5
+		im.Pix[i] = byte(v)
+	}
+	out := claudeImageWriter{data: make([]byte, 0, claudeImageOutput)}
+	err := png.Encode(&out, im)
+	t.Logf("PNG stopped: %v; bytes %d capacity %d limit %d", err, len(out.data), cap(out.data), claudeImageOutput)
+	if err == nil || cap(out.data) > claudeImageOutput || len(out.data) > claudeImageOutput {
+		t.Fatal("PNG encode was not bounded")
+	}
+	e := claudeImageRefit(im, image.Config{Width: 2000, Height: 2000, ColorModel: color.RGBAModel}, "png")
+	t.Logf("fallback type %s, output %d", e.mime, len(e.data))
+	if e.data != nil && (e.mime != "image/jpeg" || base64.StdEncoding.EncodedLen(len(e.data)) > claudeImageBase64) {
+		t.Fatal("fallback did not fit")
+	}
+}
+
+func claudeImageAlphaWebP(t *testing.T) []byte {
+	t.Helper()
+	// x/image's blue-purple-pink.lossy.webp (150x100), with a constant
+	// VP8L-coded alpha plane. The frame exercises the real lossy decoder.
+	raw, err := base64.StdEncoding.DecodeString("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")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canvas := []byte{16, 0, 0, 0, 149, 0, 0, 99, 0, 0}
+	alpha := append([]byte{1}, claudeImageLossless(150, 100, false)[5:]...)
+	return claudeImageRIFF(claudeImageChunk("VP8X", canvas), claudeImageChunk("ALPH", alpha), raw[12:])
+}
+
+func TestClaudeImageRefitWeightCapacity(t *testing.T) {
+	for _, format := range []string{"jpeg", "png"} {
+		var raw []byte
+		if format == "jpeg" {
+			raw = claudeImageJPEG(t, 8, 8)
+		} else {
+			raw = claudeImagePNGHeader(8, 8, 8, 6, 0)
+		}
+		weight := func(side int) int {
+			cfg := image.Config{Width: side, Height: side, ColorModel: color.RGBAModel}
+			holds, _ := claudeImageHolds(cfg, format, raw)
+			return claudeImageDecodeWeight(cfg, holds, true)
+		}
+		lo, hi := 2000, 20000
+		for lo+1 < hi {
+			m := (lo + hi) / 2
+			if weight(m) <= codexImageMaxBytes {
+				lo = m
+			} else {
+				hi = m
+			}
+		}
+		t.Logf("largest square %s (baseline 4:2:0 JPEG / 8-bit RGBA PNG): %dx%d weight %d; next %d", format, lo, lo, weight(lo), weight(hi))
+		if weight(lo) > codexImageMaxBytes || weight(hi) <= codexImageMaxBytes {
+			t.Fatal("capacity boundary")
+		}
+	}
+	cfg := image.Config{Width: 1, Height: claudeImageConvertPixels, ColorModel: color.Palette{color.Black}}
+	holds, _ := claudeImageHolds(cfg, "bmp", nil)
+	weight := claudeImageDecodeWeight(cfg, holds, true)
+	t.Logf("1x%d paletted BMP weight %d: over capacity, not decoded", cfg.Height, weight)
+	if weight <= codexImageMaxBytes {
+		t.Fatal("very tall BMP admitted")
 	}
 }

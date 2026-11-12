@@ -215,14 +215,14 @@ func TestClaudeImageOtherFormatsAsPNG(t *testing.T) {
 	}
 }
 
-func TestClaudeImageCompleteAnimationGoesAsItCame(t *testing.T) {
+func TestClaudeImageCompleteAnimationWithoutDecodableFrame(t *testing.T) {
 	raw := replayAnimation(t)
 	if _, _, err := image.Decode(bytes.NewReader(raw)); err == nil {
 		t.Fatal("fixture must exercise a format Go cannot decode")
 	}
 	data := base64.StdEncoding.EncodeToString(raw)
 	mt, d, note := claudeImage("image/png", data)
-	if mt != "image/webp" || d != data || note != "" {
+	if mt != "" || d != "" || note != claudeImageOmitted {
 		t.Fatalf("got %q, unchanged %v, note %q", mt, d == data, note)
 	}
 }

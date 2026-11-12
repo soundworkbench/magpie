@@ -38,7 +38,7 @@
 
 问题：重放历史消息或传入工具结果时，图片的声明类型与真实字节不符、格式不受支持或文件不完整，会让 Claude Code 拒绝整轮对话。
 
-做法：按字节识别 PNG、JPEG、GIF、WebP；BMP 在总像素不超过 3840x2160 时转成 PNG，TIFF 不解码，和无法读取或超过转换像素上限的图片一样换成一行说明，网关在入口未能转换的 HEIC 也换成一行说明。完整但 Go 无法解码的受支持格式保留给 Anthropic 判断，但 WebP 帧尺寸与画布不符或渐进式 JPEG 系数使解码开销超限时换成说明；正确标注且无需缩放的图片保持原字节。解码、缩放和编码共用字节预算，繁忙时暂时省略并在下一轮重试；这次繁忙结果不缓存，其他检查结果缓存，重放不重复解码。Claude Code 的 `media_removed` 若自行继续，就等待重发的回复；若未能回复，则返回 400 `invalid_request_error`，已开始的流发送错误事件，不轮换或休息账号。
+做法：按字节识别 PNG、JPEG、GIF、WebP；BMP 在总像素不超过 3840x2160 时转成 PNG，TIFF 不解码，和无法读取或超过转换像素上限的图片一样换成一行说明，网关在入口未能转换的 HEIC 也换成一行说明。完整但 Go 无法解码的受支持格式保留给 Anthropic 判断，但 WebP 布局不受支持、找不到可解码帧、帧尺寸与画布不符或转换开销超限时换成说明；正确标注且无需缩放的图片保持原字节。无需转换的 GIF/WebP 不解码；其他解码、缩放和有界编码共用字节预算，超限不转换，繁忙时暂时省略并在下一轮重试，等待超时后短期内缩短后续等待；这次繁忙结果不缓存，其他检查结果缓存，重放不重复解码。Claude Code 的 `media_removed` 若自行继续，就等待重发的回复；若未能回复，则返回 400 `invalid_request_error`，已开始的流发送错误事件，不轮换或休息账号。
 
 改动：`internal/gateway/claude_images.go`、`claude_subscription.go`、`internal/claudetui/transcript.go` 及其测试。构建前新增 `ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved`，并测试 `./internal/claudetui/`。当前轮图片粘贴文件的路径不变。
 

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -49,9 +50,9 @@ import (
 // the gateway did not convert at the door, any other format, or an
 // incomplete or unreadable image goes as a note. Complete supported
 // containers Go cannot decode go to Anthropic unchanged, with their real
-// type, unless a WebP frame mismatches its canvas or progressive JPEG
-// coefficients exceed the decode limit. A busy decode goes as a note and
-// is tried again on the next turn.
+// type, except for unsafe WebP layouts and images over the conversion
+// budget. Complete GIF/WebP images that fit are not decoded. A busy decode
+// goes as a note and is tried again on the next turn.
 const (
 	claudeImageSide   = 2000
 	claudeImageBase64 = 5 << 20
@@ -61,25 +62,35 @@ const (
 // the shared byte budget. The budget does not count the source bytes.
 const claudeImageConvertPixels = 3840 * 2160
 
-// All decodes share this budget through refit and encoding. It bounds
-// their combined holds, excluding raw, except that an image whose cost
-// exceeds the capacity takes it all and runs alone. A bounded wait lets
-// a busy request return a note and try the image again next turn.
+// Decodes share a byte budget through refit and encoding: decoder buffers,
+// resize copies, weights and scratch, and bounded encoder output/state.
+// It excludes raw. An image over capacity becomes a note before conversion.
+// After a wait gives up, subsequent waits are short for ConvertWait, so a
+// replay does not wait the full timeout for every image. Waiting is not fair:
+// a large weight can starve behind small ones until its wait ends, as intended.
+// Complete GIF/WebP images needing no refit do not decode or take the budget.
 var (
 	claudeImageDecodeBudget claudeImageByteBudget
 	claudeImageConvertWait  = 20 * time.Second
+	claudeImageBusyWait     = time.Second
 )
 
 type claudeImageByteBudget struct {
 	mu      sync.Mutex
 	used    int
 	changed chan struct{}
+	gaveUp  time.Time
 }
 
 func (b *claudeImageByteBudget) acquire(n int, wait time.Duration) bool {
 	if n <= 0 || n > codexImageMaxBytes {
 		return false
 	}
+	b.mu.Lock()
+	if time.Since(b.gaveUp) < claudeImageConvertWait {
+		wait = min(wait, claudeImageBusyWait)
+	}
+	b.mu.Unlock()
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	for {
@@ -97,6 +108,9 @@ func (b *claudeImageByteBudget) acquire(n int, wait time.Duration) bool {
 		select {
 		case <-changed:
 		case <-timer.C:
+			b.mu.Lock()
+			b.gaveUp = time.Now()
+			b.mu.Unlock()
 			return false
 		}
 	}
@@ -112,15 +126,22 @@ func (b *claudeImageByteBudget) release(n int) {
 	}
 }
 
-// claudeImageDecodeWeight counts the source and what the refit can keep
-// beside it. triangleResize copies 4*sw*sh RGBA bytes and holds 16*w*sh
-// float32 bytes between passes. Its two sets of triangleWeights have at
-// most 2*src+2*n floats per axis; allow doubled slice capacity, taps and
-// allocation rounding with 16*(sw+sh)+96*(w+h). The output allowance is
-// 8 bytes a pixel for resized/flattened copies plus 72 for encoded bytes
-// and bytes.Buffer growth (at most 24 per pixel, including JPEG stuffing,
-// rounded to 16x16 JPEG MCU bounds). Another 2 MiB covers encoder state and rows.
+// claudeImageDecodeWeight bounds decode plus all refit attempts, not raw.
+// codex_images.go:triangleResize holds a 4*sw*sh RGBA copy (count it even
+// when the decoder could return RGBA), a 16*w*sh float buffer and 4*w*h
+// output. triangleWeights' taps and growing float slices use at most
+// 64*(sw+sh)+192*(w+h), including discarded capacities and allocation rounding.
+// Refit may also flatten to 4*w*h RGBA. The writer reserves Output bytes,
+// and copies at most Output bytes into the cache so a small result does not
+// retain a large backing array. png/writer.go:writeImage uses six filter
+// rows of at most 8*w+1 bytes. flate/deflate.go:compressor, initDeflate and
+// huffman_bit_writer.go use <1 MiB (hash tables 640 KiB, window 64 KiB,
+// tokens 64 KiB, Huffman tables); 2 MiB covers these, PNG's 32 KiB writer,
+// JPEG writer.go:encoder's blocks/bufio and all four encoding attempts.
 func claudeImageDecodeWeight(cfg image.Config, holds int, refit bool) int {
+	if holds >= holdsMost {
+		return holdsMost
+	}
 	cost := int64(holds)
 	if refit {
 		sw, sh := int64(cfg.Width), int64(cfg.Height)
@@ -128,12 +149,35 @@ func claudeImageDecodeWeight(cfg image.Config, holds int, refit bool) int {
 		if scale := math.Min(float64(claudeImageSide)/float64(max(w, h)), 1); scale < 1 {
 			w = max(int(math.Round(float64(w)*scale)), 1)
 			h = max(int(math.Round(float64(h)*scale)), 1)
-			cost += 4*sw*sh + 16*int64(w)*sh + 16*(sw+sh) + 96*int64(w+h)
+			cost += 4*sw*sh + 16*int64(w)*sh + 64*(sw+sh) + 192*int64(w+h)
+			cost += 4 * int64(w) * int64(h)
+		} else {
+			// png/writer.go:writeImage and jpeg/writer.go:writeSOS may
+			// box colours from 16-bit/CMYK images when no resize made RGBA.
+			cost += 16 * int64(w) * int64(h)
 		}
-		cost += 80*int64((w+15)/16*16)*int64((h+15)/16*16) + 2<<20
+		cost += 4*int64(w)*int64(h) + 2*claudeImageOutput + 6*(8*int64(w)+1) + 2<<20
 	}
-	return int(min(cost, int64(codexImageMaxBytes)))
+	// Keep the cost above capacity visible to the caller.
+	return int(min(cost, int64(^uint(0)>>1)))
 }
+
+const claudeImageOutput = claudeImageBase64 / 4 * 3
+
+// A failed encode cannot grow an output beyond the inline limit. Reuse its
+// storage for the lower quality attempts; the cache gets only a sized copy.
+type claudeImageWriter struct{ data []byte }
+
+func (w *claudeImageWriter) Write(p []byte) (int, error) {
+	if len(p) > cap(w.data)-len(w.data) {
+		return 0, errors.New("image exceeds inline limit")
+	}
+	w.data = append(w.data, p...)
+	return len(p), nil
+}
+
+func (w *claudeImageWriter) Bytes() []byte { return w.data }
+func (w *claudeImageWriter) Reset()        { w.data = w.data[:0] }
 
 // claudeImageLimits keys the images claudeImage made in fitted, apart
 // from Codex's.
@@ -229,13 +273,13 @@ func claudeImageReadRecord(declared, data string) claudeImageRecord {
 	hash := sha256.New()
 	count := &claudeImageCounter{}
 	rd := bufio.NewReader(io.TeeReader(base64.NewDecoder(base64.StdEncoding, strings.NewReader(data)), io.MultiWriter(hash, count)))
-	head, _ := rd.Peek(12)
+	head, _ := rd.Peek(20)
 	record := claudeImageRecord{declared: strings.Clone(declared[:min(len(declared), 64)]), found: claudeImageType(head)}
 	if claudeImageTIFF(head) {
 		record.found = "image/tiff"
 	} else if isHEIC(head) {
 		record.found = "image/heic"
-	} else if record.found != "" || bytes.HasPrefix(head, []byte("BM")) {
+	} else if (record.found != "" || bytes.HasPrefix(head, []byte("BM"))) && (record.found != "image/webp" || claudeImageWebPStart(head)) {
 		if cfg, format, err := image.DecodeConfig(io.LimitReader(rd, 1<<20)); err == nil {
 			record.width, record.height = cfg.Width, cfg.Height
 			if record.found == "" {
@@ -394,50 +438,183 @@ func claudeJPEGComplete(raw []byte) bool {
 	return false
 }
 
-// VP8X gives DecodeConfig the canvas, but VP8L allocates from its own
-// frame header before webp compares the two. Read that header first.
-func claudeImageWebPFrame(raw []byte) (width, height int, ok bool) {
-	if claudeImageType(raw) != "image/webp" || len(raw) < 20 || string(raw[12:16]) != "VP8X" {
-		return 0, 0, false
+// webp/decode.go:decode skips unknown chunks (including ANIM/ANMF),
+// reads ALPH before VP8, and returns at the first VP8/VP8L. Mirror that
+// walk, including riff/Reader.Next's lengths and padding, without pixels.
+// VP8L otherwise allocates from its own header before comparing the canvas.
+type claudeImageWebP struct {
+	width, height                  int
+	lossless, alpha, alphaLossless bool
+}
+
+func claudeImageWebPStart(raw []byte) bool {
+	if len(raw) < 20 {
+		return false
+	}
+	switch string(raw[12:16]) {
+	case "VP8 ", "VP8L", "VP8X":
+		return true
+	}
+	return false
+}
+
+func claudeImageWebPFrame(raw []byte) (f claudeImageWebP, ok bool) {
+	if !claudeImageWebPStart(raw) {
+		return f, false
 	}
 	end := int(min(uint64(len(raw)), uint64(binary.LittleEndian.Uint32(raw[4:8]))+8))
+	seenX, wantAlpha := false, false
 	for i := 12; end-i >= 8; {
 		kind := string(raw[i : i+4])
 		n := uint64(binary.LittleEndian.Uint32(raw[i+4 : i+8]))
 		i += 8
-		data := raw[i : i+int(min(n, uint64(end-i)))]
+		if n > uint64(end-i) {
+			return f, false
+		}
+		data := raw[i : i+int(n)]
 		switch kind {
+		case "VP8X":
+			if seenX || n != 10 {
+				return f, false
+			}
+			seenX, wantAlpha = true, data[0]&16 != 0
+		case "ALPH":
+			if !wantAlpha || n < 1 || data[0]&3 > 1 {
+				return f, false
+			}
+			wantAlpha, f.alpha = false, true
+			f.alphaLossless = data[0]&3 == 1
 		case "VP8L":
-			if len(data) >= 5 && data[0] == 0x2f {
-				bits := binary.LittleEndian.Uint32(data[1:5])
-				return int(bits&0x3fff) + 1, int(bits>>14&0x3fff) + 1, true
+			if f.alpha || len(data) < 5 || data[0] != 0x2f || data[4]>>5 != 0 {
+				return f, false
 			}
-			return 0, 0, false
+			bits := binary.LittleEndian.Uint32(data[1:5])
+			f.width, f.height, f.lossless = int(bits&0x3fff)+1, int(bits>>14&0x3fff)+1, true
+			return f, true
 		case "VP8 ":
-			if len(data) >= 10 && bytes.Equal(data[3:6], []byte{0x9d, 0x01, 0x2a}) {
-				return int(binary.LittleEndian.Uint16(data[6:8]) & 0x3fff), int(binary.LittleEndian.Uint16(data[8:10]) & 0x3fff), true
+			if wantAlpha || n >= 1<<31 || len(data) < 10 || data[0]&1 != 0 || !bytes.Equal(data[3:6], []byte{0x9d, 1, 0x2a}) {
+				return f, false
 			}
-			return 0, 0, false
+			f.width = int(binary.LittleEndian.Uint16(data[6:8]) & 0x3fff)
+			f.height = int(binary.LittleEndian.Uint16(data[8:10]) & 0x3fff)
+			return f, true
 		}
 		n += n & 1
 		if n > uint64(end-i) {
-			break
+			return f, false
 		}
 		i += int(n)
 	}
-	return 0, 0, false
+	return f, false
 }
 
-// Progressive JPEG keeps coefficient blocks for every component until
-// the last scan, besides the pixels counted by imageHolds.
+// vp8l/decode.go:decodeHuffmanGroups preallocates up to 65536 hGroups.
+// huffman.go:hTree is a slice header plus 128 uint32 LUT entries, five
+// per group. The test pins the compiled layout; 2680 also covers 32-bit.
+const claudeImageHGroupBytes = 2680
+
+func claudeImageLosslessHolds(w, h, input int64) int64 {
+	// decodePix's NRGBA, inverseColorIndexing's second full image, and
+	// decodeTransform/decodeHuffmanGroups' tile images (even a repeated
+	// transform is decoded before rejection). 16*p covers all those pixels.
+	// Each non-simple tree consumes at least 17 header bits before allocating
+	// lengths; huffman.go:build/codeLengthsToCodes allocate at most 24*2328
+	// bytes per tree. 32768/input byte covers these, simple nodes, rounding,
+	// and decodePix's 8192-byte color caches. The fixed MiB covers partial
+	// trees, subsidiary groups, palette transforms and reader state.
+	return 16*w*h + 65536*claudeImageHGroupBytes + 32768*input + 1<<20
+}
+
+// Header-only bounds for the allocations made by the registered decoders.
+// The fixed 128 KiB covers reader/decoder structs, palettes, LZW/zlib state
+// (including flate's 32 KiB window), and per-allocation page rounding.
 func claudeImageHolds(cfg image.Config, format string, raw []byte) (int, bool) {
-	holds, ok := imageHolds(cfg, format)
-	if !ok || holds == holdsMost || format != "jpeg" || !bytes.HasPrefix(raw, []byte{0xff, 0xd8}) {
-		return holds, ok
+	w, h := int64(cfg.Width), int64(cfg.Height)
+	if w <= 0 || h <= 0 {
+		return 0, false
 	}
+	if w > int64(holdsMost)/h {
+		return holdsMost, true
+	}
+	p, cost := w*h, int64(128<<10)
+	switch format {
+	case "png":
+		if len(raw) < 29 {
+			return holdsMost, false
+		}
+		bpp := int64(4)
+		if raw[24] == 16 {
+			bpp = 8
+		}
+		if raw[25] == 3 {
+			bpp = 1
+		}
+		// png/reader.go:readImagePass: tRNS may promote grey/truecolour
+		// to NRGBA/NRGBA64 after DecodeConfig returned at IHDR.
+		cost += bpp * p
+		passes := int64(1)
+		if raw[28] == 1 {
+			// decode holds the final image beside pass images. Adam7
+			// partitions the pixels, so all seven pass allocations sum to p.
+			cost += bpp * p
+			passes = 7
+		}
+		// readImagePass's current/previous filter rows, at most 8*w+1.
+		cost += passes * 2 * (8*w + 1)
+	case "jpeg":
+		var ok bool
+		cost, ok = claudeImageJPEGHolds(cfg, raw)
+		if !ok {
+			return holdsMost, false
+		}
+	case "gif":
+		// gif/reader.go:newImageFromDescriptor checks frame <= canvas;
+		// readImageDescriptor/uninterlace hold two paletted pixel arrays.
+		cost += 2 * p
+	case "bmp":
+		// bmp/reader.go:decodePaletted has one byte/pixel and a padded
+		// row. decodeRGB has RGBA plus a BGR row; decodeNRGBA has NRGBA.
+		if _, paletted := cfg.ColorModel.(color.Palette); paletted {
+			cost += p + w + 4
+		} else {
+			cost += 4*p + 3*w + 4
+		}
+	case "webp":
+		f, ok := claudeImageWebPFrame(raw)
+		if !ok || f.width != cfg.Width || f.height != cfg.Height {
+			return holdsMost, false
+		}
+		if f.lossless {
+			cost += claudeImageLosslessHolds(w, h, int64(len(raw)))
+		} else {
+			mx, my := (w+15)/16, (h+15)/16
+			// vp8/decode.go:ensureImg: padded 4:2:0 planes, filterParam
+			// per macroblock and mb per column. parseOtherHeaders and
+			// parseOtherPartitions copy input; a malformed first partition
+			// can ask for 19 bits' worth before its read fails.
+			cost += 384*mx*my + 4*mx*my + 6*mx + int64(len(raw)) + 1<<19
+			if f.alpha {
+				cost += p
+			} // webp/decode.go:readAlpha's A plane
+			if f.alphaLossless {
+				cost += claudeImageLosslessHolds(w, h, int64(len(raw)))
+			}
+		}
+	default:
+		return 0, false
+	}
+	return int(min(cost, int64(holdsMost))), true
+}
+
+// jpeg/reader.go:processSOF and isRGB decide sampling and colour. Metadata
+// may follow SOF or scans, so skip entropy and inspect every marker through
+// EOI, as the decoder does. No pixels are read.
+func claudeImageJPEGHolds(cfg image.Config, raw []byte) (int64, bool) {
+	var hv [4][2]int64
+	var ids [4]byte
+	nComp, progressive, jfif, adobeRGB := 0, false, false, false
 	for i := 2; i < len(raw); {
 		if raw[i] != 0xff {
-			// image/jpeg tolerates stray bytes between markers.
 			i++
 			continue
 		}
@@ -449,29 +626,72 @@ func claudeImageHolds(cfg image.Config, format string, raw []byte) (int, bool) {
 		}
 		marker := raw[i]
 		i++
-		if marker == 0xda || marker == 0xd9 {
+		if marker == 0xd9 {
 			break
 		}
-		if marker == 0 || marker == 0x01 || marker >= 0xd0 && marker <= 0xd8 {
+		if marker == 0 || marker == 1 || marker >= 0xd0 && marker <= 0xd8 {
 			continue
 		}
 		if len(raw)-i < 2 {
-			break
+			return 0, false
 		}
 		n := int(binary.BigEndian.Uint16(raw[i : i+2]))
 		if n < 2 || n > len(raw)-i {
-			break
+			return 0, false
 		}
-		if marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc {
-			if marker == 0xc2 && n >= 8 {
-				cost := int64(holds) + 4*int64(raw[i+7])*int64(cfg.Width)*int64(cfg.Height)
-				return int(min(cost, int64(holdsMost))), true
+		seg := raw[i+2 : i+n]
+		switch marker {
+		case 0xe0:
+			if len(seg) >= 5 {
+				jfif = string(seg[:5]) == "JFIF\x00"
 			}
-			break
+		case 0xee:
+			if len(seg) >= 12 && string(seg[:5]) == "Adobe" {
+				adobeRGB = seg[11] == 0
+			}
+		case 0xc0, 0xc1, 0xc2:
+			if nComp != 0 || len(seg) < 6 || seg[0] != 8 {
+				return 0, false
+			}
+			nComp, progressive = int(seg[5]), marker == 0xc2
+			if (nComp != 1 && nComp != 3 && nComp != 4) || len(seg) != 6+3*nComp {
+				return 0, false
+			}
+			for c := 0; c < nComp; c++ {
+				ids[c] = seg[6+3*c]
+				hv[c] = [2]int64{int64(seg[7+3*c] >> 4), int64(seg[7+3*c] & 15)}
+				if hv[c][0] < 1 || hv[c][0] > 4 || hv[c][1] < 1 || hv[c][1] > 4 {
+					return 0, false
+				}
+			}
+			if nComp == 1 {
+				hv[0] = [2]int64{1, 1}
+			}
 		}
 		i += n
 	}
-	return holds, ok
+	if nComp == 0 {
+		return 0, false
+	}
+	w, h := int64(cfg.Width), int64(cfg.Height)
+	mx, my := (w+8*hv[0][0]-1)/(8*hv[0][0]), (h+8*hv[0][1]-1)/(8*hv[0][1])
+	cost := int64(128 << 10)
+	var planes int64
+	for c := 0; c < nComp; c++ {
+		// jpeg/scan.go:makeImg's MCU-padded planes, blackPix included.
+		plane := 64 * mx * my * hv[c][0] * hv[c][1]
+		cost += plane
+		// processSOS keeps 64 int32 coefficients per padded block.
+		planes += plane
+	}
+	if progressive {
+		cost += max(4*planes, 4*int64(nComp)*w*h)
+	}
+	if nComp == 4 || nComp == 3 && !jfif && (adobeRGB || ids == [4]byte{'R', 'G', 'B', 0}) {
+		// jpeg/reader.go:convertToRGB/applyBlack's RGBA or CMYK copy.
+		cost += 4 * w * h
+	}
+	return cost, true
 }
 
 func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEntry, bool) {
@@ -514,6 +734,9 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 	if mt == "" && !bytes.HasPrefix(raw, []byte("BM")) {
 		return omit("unsupported image type", len(raw)), true
 	}
+	if mt == "image/webp" && !claudeImageWebPStart(raw) {
+		return omit("unsupported WebP layout", len(raw)), true
+	}
 	cfg, format, headerErr := image.DecodeConfig(bytes.NewReader(raw))
 	if headerErr == nil {
 		record.width, record.height = cfg.Width, cfg.Height
@@ -530,6 +753,12 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 	if (mt == "image/gif" || mt == "image/webp") && !claudeImageComplete(mt, raw) {
 		return omit("incomplete image container", len(raw)), true
 	}
+	if mt == "image/webp" {
+		f, ok := claudeImageWebPFrame(raw)
+		if !ok || headerErr == nil && (f.width != cfg.Width || f.height != cfg.Height) {
+			return omit("WebP frame does not match its canvas", len(raw)), true
+		}
+	}
 	if headerErr != nil {
 		if claudeImageComplete(mt, raw) {
 			return fitEntry{mime: mt}, true
@@ -542,14 +771,19 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 	if format == "bmp" && cfg.Width > 0 && cfg.Height > 0 && (cfg.Width > claudeImageConvertPixels || cfg.Height > claudeImageConvertPixels/cfg.Width) {
 		return omit("image too large to convert", len(raw)), true
 	}
-	if w, h, ok := claudeImageWebPFrame(raw); ok && (w != cfg.Width || h != cfg.Height) {
-		return omit("WebP frame does not match its canvas", len(raw)), true
+	refit := mt == "" || cfg.Width > claudeImageSide || cfg.Height > claudeImageSide || len(data) > claudeImageBase64
+	// Complete GIF/WebP containers that fail Decode go unchanged anyway.
+	// Without a refit there is no reason to decode their pixels or take a slot.
+	if !refit && (format == "gif" || format == "webp") {
+		return fitEntry{mime: mt}, true
 	}
 	holds, ok := claudeImageHolds(cfg, format, raw)
+	weight := claudeImageDecodeWeight(cfg, holds, refit)
+	if refit && (!ok || weight > codexImageMaxBytes) {
+		return omit("image too large to convert", len(raw)), true
+	}
 	if !ok || holds > codexImageMaxBytes-len(raw) {
-		// A progressive frame whose coefficients exceed the limit must
-		// not borrow the complete-container fallback for unreadable files.
-		if pixels, _ := imageHolds(cfg, format); format == "jpeg" && holds > pixels {
+		if format == "jpeg" && ok {
 			return omit("image exceeds the decode limit", len(raw)), true
 		}
 		if claudeImageComplete(mt, raw) {
@@ -557,8 +791,6 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 		}
 		return omit("image exceeds the decode limit", len(raw)), true
 	}
-	refit := mt == "" || cfg.Width > claudeImageSide || cfg.Height > claudeImageSide || len(data) > claudeImageBase64
-	weight := claudeImageDecodeWeight(cfg, holds, refit)
 	if !claudeImageDecodeBudget.acquire(weight, claudeImageConvertWait) {
 		e := omit("conversion slot busy", len(raw))
 		e.data = []byte(claudeImageOmittedBusy)
@@ -597,14 +829,14 @@ func claudeImageRefit(src image.Image, cfg image.Config, format string) fitEntry
 		src = triangleResize(src, w, h)
 	}
 	fits := func(b []byte) bool { return base64.StdEncoding.EncodedLen(len(b)) <= claudeImageBase64 }
-	var out bytes.Buffer
+	out := claudeImageWriter{data: make([]byte, 0, claudeImageOutput)}
 	if format == "jpeg" {
 		err = jpeg.Encode(&out, src, &jpeg.Options{Quality: 85})
 		if err == nil && fits(out.Bytes()) {
-			return fitEntry{mime: "image/jpeg", data: out.Bytes()}
+			return fitEntry{mime: "image/jpeg", data: bytes.Clone(out.Bytes())}
 		}
 	} else if err = png.Encode(&out, src); err == nil && fits(out.Bytes()) {
-		return fitEntry{mime: "image/png", data: out.Bytes()}
+		return fitEntry{mime: "image/png", data: bytes.Clone(out.Bytes())}
 	}
 	// still over the limit: JPEG, on white where it was clear
 	flat := image.NewRGBA(src.Bounds())
@@ -613,7 +845,7 @@ func claudeImageRefit(src image.Image, cfg image.Config, format string) fitEntry
 	for _, q := range []int{75, 60, 40} {
 		out.Reset()
 		if jpeg.Encode(&out, flat, &jpeg.Options{Quality: q}) == nil && fits(out.Bytes()) {
-			return fitEntry{mime: "image/jpeg", data: out.Bytes()}
+			return fitEntry{mime: "image/jpeg", data: bytes.Clone(out.Bytes())}
 		}
 	}
 	return fitEntry{}
