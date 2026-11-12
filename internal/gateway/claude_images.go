@@ -1,18 +1,24 @@
 package gateway
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	_ "image/gif"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"log"
 	"math"
 	"strconv"
+	"strings"
+	"sync"
 
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/tiff"
@@ -57,12 +63,7 @@ const claudeImageOmitted = "[An image was left out: the gateway could not read i
 // a note in their place. A cached verdict includes the declared type:
 // an image a client labels differently must not borrow that verdict.
 func claudeImage(mediaType, data string) (string, string, string) {
-	key := fitKey(strconv.Itoa(len(mediaType))+":"+mediaType+data, claudeImageLimits)
-	e, ok := fitted.get(key)
-	if !ok {
-		e = claudeImageChecked(mediaType, data)
-		fitted.put(key, e)
-	}
+	e, _ := claudeImageVerdict(mediaType, data)
 	if e.mime == "text/plain" {
 		return "", "", claudeImageOmitted
 	}
@@ -70,6 +71,84 @@ func claudeImage(mediaType, data string) (string, string, string) {
 		return e.mime, data, ""
 	}
 	return e.mime, base64.StdEncoding.EncodeToString(e.data), ""
+}
+
+// Records describe the input bytes, including images replaced by notes.
+// The verdict cache owns encoded output; this bounded companion keeps no
+// image bytes and uses the very same key, including the full declared type.
+type claudeImageRecord struct {
+	declared, found, hash, action string
+	bytes, width, height          int
+}
+
+var claudeImageRecords = struct {
+	sync.Mutex
+	m map[[32]byte]claudeImageRecord
+}{m: make(map[[32]byte]claudeImageRecord)}
+
+func claudeImageVerdict(declared, data string) (fitEntry, claudeImageRecord) {
+	key := fitKey(strconv.Itoa(len(declared))+":"+declared+data, claudeImageLimits)
+	claudeImageRecords.Lock()
+	record, recorded := claudeImageRecords.m[key]
+	claudeImageRecords.Unlock()
+	e, ok := fitted.get(key)
+	if !ok {
+		e = claudeImageChecked(declared, data, &record)
+		fitted.put(key, e)
+	} else if !recorded {
+		// The verdict can outlive its record. Read only the header and
+		// hash the bytes again, never decode the pixels a second time.
+		record = claudeImageReadRecord(declared, data)
+	}
+	if !ok || !recorded {
+		record.action = "as-is"
+		if e.mime == "text/plain" {
+			record.action = "note"
+		} else if e.data != nil {
+			record.action = "re-encoded"
+		}
+		claudeImageRecords.Lock()
+		if len(claudeImageRecords.m) >= 8192 {
+			for k := range claudeImageRecords.m {
+				delete(claudeImageRecords.m, k)
+				break
+			}
+		}
+		claudeImageRecords.m[key] = record
+		claudeImageRecords.Unlock()
+	}
+	return e, record
+}
+
+func claudeImageDetails(declared, data string) claudeImageRecord {
+	_, record := claudeImageVerdict(declared, data)
+	return record
+}
+
+// An image over the read limit still gets a diagnostic without allocating
+// its decoded bytes. This also fills a record evicted before its verdict.
+func claudeImageReadRecord(declared, data string) claudeImageRecord {
+	hash := sha256.New()
+	count := &claudeImageCounter{}
+	rd := bufio.NewReader(io.TeeReader(base64.NewDecoder(base64.StdEncoding, strings.NewReader(data)), io.MultiWriter(hash, count)))
+	head, _ := rd.Peek(12)
+	record := claudeImageRecord{declared: strings.Clone(declared[:min(len(declared), 64)]), found: claudeImageType(head)}
+	if cfg, format, err := image.DecodeConfig(rd); err == nil {
+		record.width, record.height = cfg.Width, cfg.Height
+		if record.found == "" {
+			record.found = "image/" + format
+		}
+	}
+	_, _ = io.Copy(io.Discard, rd)
+	record.bytes, record.hash = count.n, fmt.Sprintf("%x", hash.Sum(nil)[:4])
+	return record
+}
+
+type claudeImageCounter struct{ n int }
+
+func (c *claudeImageCounter) Write(b []byte) (int, error) {
+	c.n += len(b)
+	return len(b), nil
 }
 
 // claudeImageType reads only the magic number, never the client's label.
@@ -205,28 +284,39 @@ func claudeJPEGComplete(raw []byte) bool {
 	return false
 }
 
-func claudeImageChecked(declared, data string) fitEntry {
-	mt := imageMediaType(Part{Data: data})
+func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEntry {
+	declared = strings.Clone(declared[:min(len(declared), 64)])
+	mt := ""
+	*record = claudeImageRecord{declared: declared}
 	omit := func(reason string, size int) fitEntry {
-		log.Printf("claude: image replaced by a note (declared %q, found %q, %d bytes): %s", declared, mt, size, reason)
+		log.Printf("claude: image replaced by a note (declared %q, found %q, %d bytes): %s; %dx%d sha256 %s", declared, mt, size, reason, record.width, record.height, record.hash)
 		return fitEntry{mime: "text/plain"}
 	}
 	if len(data) > codexImageMaxBytes {
+		*record = claudeImageReadRecord(declared, data)
+		mt = record.found
 		return omit("image exceeds the read limit", base64.StdEncoding.DecodedLen(len(data)))
 	}
 	raw, err := base64.StdEncoding.DecodeString(data)
+	sum := sha256.Sum256(raw)
+	cfg, format, headerErr := image.DecodeConfig(bytes.NewReader(raw))
+	record.found, record.bytes, record.hash = claudeImageType(raw), len(raw), fmt.Sprintf("%x", sum[:4])
+	if headerErr == nil {
+		record.width, record.height = cfg.Width, cfg.Height
+	}
+	mt = record.found
+	if record.found == "" && headerErr == nil {
+		record.found = "image/" + format
+	}
 	if err != nil {
 		return omit("invalid base64", len(raw))
 	}
-	// A line break in the base64 head can leave too few bytes to sniff.
-	mt = claudeImageType(raw)
 	// GIF decoding stops at the first frame; WebP may promise more chunks.
 	// PNG and JPEG decoding reads to the end of the image itself.
 	if (mt == "image/gif" || mt == "image/webp") && !claudeImageComplete(mt, raw) {
 		return omit("incomplete image container", len(raw))
 	}
-	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
-	if err != nil {
+	if headerErr != nil {
 		if claudeImageComplete(mt, raw) {
 			return fitEntry{mime: mt}
 		}
@@ -257,7 +347,7 @@ func claudeImageChecked(declared, data string) fitEntry {
 	if mt == "" {
 		reason = "unsupported image type"
 	}
-	log.Printf("claude: image re-encoded as %s (declared %q, found %q, %d bytes): %s", e.mime, declared, "image/"+format, len(raw), reason)
+	log.Printf("claude: image re-encoded as %s (declared %q, found %q, %d bytes): %s; %dx%d sha256 %s", e.mime, declared, "image/"+format, len(raw), reason, record.width, record.height, record.hash)
 	return e
 }
 

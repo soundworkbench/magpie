@@ -198,6 +198,12 @@ type subscriptionRun struct {
 	// has it under (bridgeToolName), for those it differs: under r.mu
 	names map[string]string
 
+	// Images handed over in replay/prompt blocks and MCP results during
+	// this run, under mu. Older turns remain in Claude Code's history.
+	// Current-turn files pasted by claudetui are not covered here.
+	images        []claudeImageRecord
+	imagesDropped int
+
 	mu sync.Mutex
 	// sending is held across a send to the segment and taken before it is
 	// closed, so a send blocked on a full segment no one reads yet holds
@@ -1290,6 +1296,20 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	run.lean = req.leanPrompt
 	run.appended = req.appendPrompt
 	run.tui = tui
+	if req.replayed {
+		run.noteMessageImages(req.Messages[:historyEnd(req.Messages)-1])
+	} else if tui && from == nil {
+		// Told history also passes imageBlocks; the current turn's files
+		// are fitted again by Claude Code after claudetui pastes them.
+		run.noteMessageImages(req.Messages[:historyEnd(req.Messages)])
+	}
+	if !tui {
+		messages := req.Messages
+		if from != nil {
+			messages = messages[len(messages)-len(from.since):]
+		}
+		run.noteMessageImages(messages)
+	}
 	run.cachePrefix = prefix
 	if tuiBody != "" {
 		run.safeguards = bytes.Clone(req.Safeguards)
@@ -1976,6 +1996,9 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 	// the message's id is the turn's, to rewind to if the client gives up
 	// on it
 	turn := newUUID()
+	if !run.tui {
+		run.noteMessageImages(since)
+	}
 	line, _ := json.Marshal(map[string]any{"type": "user", "uuid": turn, "message": map[string]any{"role": "user", "content": renderClaudeTurn(since, req.Tools)}})
 	run.mu.Lock()
 	if run.closed {
@@ -3811,7 +3834,19 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	// closed empty when the run ended, and a reply asked for whole went
 	// as a 200 with no content and no usage, which the client took for
 	// the answer (steven_4422, 18 images to claude-sonnet-5-5).
-	mediaRemoved := ""   // Anthropic refused an image; Claude Code may ask again
+	mediaRemoved := ""          // Anthropic refused an image; Claude Code may ask again
+	var mediaSegment chan Event // under pmu, like mediaRemoved
+	// A notice belongs to the request waiting for the resent reply, never
+	// to a later tool-result request attached to this same turn.
+	mediaPending := func() bool { // pmu held
+		r.mu.Lock()
+		same := mediaSegment != nil && mediaSegment == r.segment
+		r.mu.Unlock()
+		if !same {
+			mediaRemoved, mediaSegment = "", nil
+		}
+		return mediaRemoved != ""
+	}
 	begun := false       // a message began since the turn's last result
 	aside := ""          // what Claude Code said in its own words this turn
 	retell := false      // the run is told to make its calls once this turn's result is in
@@ -3849,6 +3884,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			default:
 				text(held)
 			}
+			mediaRemoved, mediaSegment = "", nil
 			r.emit(Event{Kind: KStop, Stop: stopFromAnthropic(why)})
 		}
 	}
@@ -3861,7 +3897,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		}
 		unstreamed = ""
 		end(unstreamedStop)
-		if mediaRemoved != "" && unstreamedStop == "" {
+		if mediaPending() && unstreamedStop == "" {
 			return // the turn's result must say whether the retry answered
 		}
 		if !inside {
@@ -4038,7 +4074,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	// failed ends the reply with an error where it was cut short with
 	// nothing to go on in
 	failed := func(why string) {
-		if mediaRemoved != "" {
+		if mediaPending() {
 			mediaFailure()
 			return
 		}
@@ -4115,6 +4151,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		}
 		if envelope.Type == "result" && (envelope.APIError == "media_removed" ||
 			envelope.IsError && strings.Contains(strings.ToLower(envelope.Result), claudetui.MediaRemovedSentence)) {
+			if mediaRemoved == "" {
+				r.logImages()
+			}
 			if envelope.APIError != "media_removed" && mediaRemoved == "" {
 				log.Printf("claude: media_removed: media=%q reason=%q continues=false message_bytes=%d", "image", "unprocessable", len(envelope.Result))
 			}
@@ -4127,10 +4166,15 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			return
 		}
 		if envelope.Type == "media_removed" {
+			r.mu.Lock()
+			mediaSegment = r.segment
+			r.mu.Unlock()
+			r.logImages()
 			mediaRemoved = envelope.Result
 			if mediaRemoved == "" {
 				mediaRemoved = claudetui.MediaRemovedMessage("")
 			}
+			mediaPending() // a notice with no open segment is not kept
 			return
 		}
 		var whole struct {
@@ -4156,6 +4200,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				for _, c := range whole.Content {
 					if c.Type == "text" && strings.Contains(strings.ToLower(c.Text), claudetui.MediaRemovedSentence) {
 						if mediaRemoved == "" {
+							r.logImages()
 							log.Printf("claude: media_removed: media=%q reason=%q continues=false message_bytes=%d", "image", "unprocessable", len(c.Text))
 						}
 						mediaRemoved = claudetui.MediaRemovedMessage("")
@@ -4281,7 +4326,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				}
 				r.emit(Event{Kind: KError, Text: text, Status: envelope.APIErrorStatus, Code: errKind, RequestID: reqID})
 				r.endSegment()
-			case mediaRemoved != "" && r.waitingOnReply() &&
+			case mediaPending() && r.waitingOnReply() &&
 				(silent || cut || !waiting && r.replyUnended() || waiting && (len(envelope.StructuredOutput) == 0 || string(envelope.StructuredOutput) == "null")):
 				mediaFailure()
 			case cut:
@@ -4501,7 +4546,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	defer pmu.Unlock()
 	over = true
 	settle()
-	if mediaRemoved != "" && r.waitingOnReply() {
+	if mediaPending() && r.waitingOnReply() {
 		mediaFailure()
 	} else if err := s.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
 		r.emit(Event{Kind: KError, Text: err.Error()})
@@ -5845,6 +5890,7 @@ func (r *subscriptionRun) continueWith(results []Part, said string, tools []brid
 	delivered := 0
 	for _, p := range results {
 		result := mcpResult(p)
+		r.noteImages(p.Images)
 		result.Tools = tools
 		r.mu.Lock()
 		waiter := r.pending[p.CallID]
@@ -5911,6 +5957,57 @@ func (r *subscriptionRun) queue(said string) error {
 		log.Printf("claude: Claude Code didn't say it queued the user's words sent with tool results in %s; the results go on", queuedWait)
 	}
 	return nil
+}
+
+// noteMessageImages follows the same image parts as renderCachedParts.
+func (r *subscriptionRun) noteMessageImages(messages []Message) {
+	for _, m := range messages {
+		for _, p := range m.Parts {
+			switch p.Kind {
+			case Image:
+				r.noteImages([]Part{p})
+			case ToolResult:
+				r.noteImages(p.Images)
+			}
+		}
+	}
+}
+
+func (r *subscriptionRun) noteImages(images []Part) {
+	for _, im := range images {
+		if im.Data == "" && im.URL != "" {
+			continue // no bytes were handed over
+		}
+		record := claudeImageDetails(im.MediaType, im.Data)
+		r.mu.Lock()
+		if len(r.images) == 64 {
+			copy(r.images, r.images[1:])
+			r.images = r.images[:63]
+			r.imagesDropped++
+		}
+		r.images = append(r.images, record)
+		r.mu.Unlock()
+	}
+}
+
+func (r *subscriptionRun) logImages() {
+	r.mu.Lock()
+	images := slices.Clone(r.images)
+	dropped := r.imagesDropped
+	r.mu.Unlock()
+	var line strings.Builder
+	fmt.Fprintf(&line, "claude: media_removed: %d images handed over", len(images)+dropped)
+	if dropped > 0 {
+		fmt.Fprintf(&line, " (%d not listed)", dropped)
+	}
+	for i, im := range images {
+		sep := ";"
+		if i == 0 {
+			sep = ":"
+		}
+		fmt.Fprintf(&line, "%s [%d] declared %q found %q %d bytes %dx%d sha256 %s %s", sep, i+1, im.declared, im.found, im.bytes, im.width, im.height, im.hash, im.action)
+	}
+	log.Print(line.String())
 }
 
 // mcpResult is a tool result as an MCP tools/call answers: its text, then

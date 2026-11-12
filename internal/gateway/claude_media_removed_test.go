@@ -3,11 +3,14 @@ package gateway
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/yetone/magpie/internal/claudetui"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 const mediaRemovedNotice = `{"type":"media_removed","result":"Could not process image"}`
@@ -165,5 +168,133 @@ func TestMediaRemovedOrdinaryFailureAfterPartialReply(t *testing.T) {
 	<-done
 	if failure.Status != 502 || !strings.Contains(failure.Text, "stream from Anthropic was cut short") {
 		t.Fatalf("ordinary cut changed: %+v", failure)
+	}
+}
+
+// The MCP callback releases the fake only after the second HTTP request
+// has attached and delivered the client's tool result to the same run.
+func mediaRemovedLaterReply(t *testing.T, notice bool, ending string) (int, string) {
+	t.Helper()
+	gate := filepath.Join(t.TempDir(), "result")
+	lines := []string{mediaRemovedStart,
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"mcp__magpie__read"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"}}}`, mediaRemovedEnd}
+	if notice {
+		lines = append([]string{mediaRemovedNotice}, lines...)
+	}
+	script := `while read -r line; do
+ case $line in *'"type":"control_request"'*)
+ id=$(printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+ echo '{"type":"control_response","response":{"subtype":"success","request_id":"'$id'"}}'
+ continue ;;
+ esac
+ break
+done
+` + mediaRemovedScript(lines...) + `while [ ! -f "` + gate + `" ]; do sleep 0.01; done
+`
+	switch ending {
+	case "cut":
+		script += mediaRemovedScript(strings.ReplaceAll(mediaRemovedStart, "m1", "m2"), mediaRemovedText, mediaRemovedEnd)
+	case "exit":
+		script += mediaRemovedScript(strings.ReplaceAll(mediaRemovedStart, "m1", "m2"), mediaRemovedText)
+	case "result":
+		script += mediaRemovedScript(mediaRemovedResult)
+	}
+	h := tuiScriptHarness(t, script+"exit 0\n")
+	ask := func(messages string) (int, string) {
+		body := `{"model":"claude-sonnet-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[` + messages + `]}`
+		rec := httptest.NewRecorder()
+		var u Usage
+		code, msg := h.s.serveClaudeSubscription(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, h.p, "claude-sonnet-5", []byte(body), &u)
+		if rec.Code != code {
+			t.Fatalf("HTTP status %d differs from returned status %d", rec.Code, code)
+		}
+		if code == 502 && u.ErrType == "media_removed" {
+			t.Fatal("later failure still has the media_removed code")
+		}
+		if code == 200 {
+			msg = rec.Body.String()
+		}
+		return code, msg
+	}
+	const first = `{"role":"user","content":"look"}`
+	code, reply := ask(first)
+	if code != 200 || !strings.Contains(reply, `"stop_reason":"tool_use"`) {
+		t.Fatalf("first reply: %d %s", code, reply)
+	}
+	h.s.subscription.mu.Lock()
+	var run *subscriptionRun
+	for _, r := range h.s.subscription.runs {
+		run = r
+	}
+	h.s.subscription.mu.Unlock()
+	if run == nil {
+		t.Fatal("no run waiting for the client's tool")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest("POST", "/cb/"+run.token, strings.NewReader(`{"tool_call_id":"c1","name":"read","arguments":{}}`))
+		req.SetPathValue("token", run.token)
+		h.s.subscription.mcpCall(httptest.NewRecorder(), req)
+		if err := os.WriteFile(gate, []byte("done\n"), 0600); err != nil {
+			t.Error(err)
+		}
+	}()
+	t.Cleanup(func() { h.s.subscription.abortAll(); <-done })
+	eventually(t, "tool callback did not register", func() bool {
+		h.s.subscription.mu.Lock()
+		defer h.s.subscription.mu.Unlock()
+		return h.s.subscription.calls["c1"] != nil
+	})
+	code, reply = ask(first + `,{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"done"}]}`)
+	<-done
+	if len(h.runs()) != 1 {
+		t.Fatal("tool result started another run")
+	}
+	return code, reply
+}
+
+func TestMediaRemovedEndsWithTheResentReply(t *testing.T) {
+	for _, ending := range []string{"cut", "exit", "result"} {
+		t.Run(ending, func(t *testing.T) {
+			var baselineCode int
+			var baseline string
+			t.Run("without notice", func(t *testing.T) { baselineCode, baseline = mediaRemovedLaterReply(t, false, ending) })
+			t.Run("with notice", func(t *testing.T) {
+				code, reply := mediaRemovedLaterReply(t, true, ending)
+				want := "cut short"
+				if ending == "exit" {
+					want = "ended its reply"
+				}
+				if ending == "result" {
+					want = baseline
+				}
+				if code != 502 || code != baselineCode || !strings.Contains(reply, want) || strings.Contains(reply, "media_removed") {
+					t.Fatalf("later %s: %d %s; without notice: %d %s", ending, code, reply, baselineCode, baseline)
+				}
+			})
+		})
+	}
+}
+
+func TestMediaRemovedLogsEachNoticeOnce(t *testing.T) {
+	for _, lines := range [][]string{
+		{mediaRemovedNotice, mediaRemovedResult},
+		{`{"type":"result","is_error":true,"api_error":"media_removed","result":"Could not process image"}`},
+		{`{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: an image in the conversation could not be processed and was removed."}]}}`,
+			`{"type":"result","is_error":true,"result":"API Error: an image in the conversation could not be processed and was removed."}`},
+	} {
+		t.Run(lines[0], func(t *testing.T) {
+			logs := keepLog(t)
+			run := &subscriptionRun{}
+			run.attach()
+			run.readOutput(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+			if got := strings.Count(logs.String(), "0 images handed over"); got != 1 {
+				t.Fatalf("%d inventories: %s", got, logs.String())
+			}
+		})
 	}
 }

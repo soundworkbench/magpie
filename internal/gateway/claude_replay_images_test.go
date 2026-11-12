@@ -2,9 +2,11 @@ package gateway
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/gif"
@@ -355,5 +357,146 @@ func TestClaudeImageCacheSeparatesTheDeclaredType(t *testing.T) {
 	mt, d, note = claudeImage("image/png", "charset=binary;"+data)
 	if mt != "" || d != "" || note != claudeImageOmitted {
 		t.Fatal("invalid base64 borrowed the valid image's verdict")
+	}
+}
+
+func TestClaudeImageDiagnosticRecord(t *testing.T) {
+	for _, format := range []string{"jpeg", "png", "bmp"} {
+		raw := replayImage(t, format)
+		action := "as-is"
+		if format == "png" {
+			raw = raw[:len(raw)*55/100]
+			action = "note"
+		}
+		if format == "bmp" {
+			action = "re-encoded"
+		}
+		declared := "image/png"
+		data := base64.StdEncoding.EncodeToString(raw)
+		claudeImage(declared, data)
+		record := claudeImageDetails(declared, data)
+		sum := sha256.Sum256(raw)
+		found := "image/" + format
+		if record.declared != declared || record.found != found || record.bytes != len(raw) || record.width != 8 || record.height != 8 || record.hash != fmt.Sprintf("%x", sum[:4]) || record.action != action {
+			t.Fatalf("%s record: %+v", format, record)
+		}
+		// A cached verdict must still supply a record after record eviction.
+		key := fitKey(fmt.Sprint(len(declared))+":"+declared+data, claudeImageLimits)
+		claudeImageRecords.Lock()
+		delete(claudeImageRecords.m, key)
+		claudeImageRecords.Unlock()
+		if again := claudeImageDetails(declared, data); again != record {
+			t.Fatalf("record after eviction: %+v, want %+v", again, record)
+		}
+	}
+}
+
+func TestMediaRemovedLogsReplayImages(t *testing.T) {
+	logs := keepLog(t)
+	h := tuiScriptHarness(t, mediaRemovedScript(mediaRemovedNotice))
+	jpeg := replayImage(t, "jpeg")
+	png := replayImage(t, "png")
+	png = png[:len(png)*55/100]
+	images := []string{base64.StdEncoding.EncodeToString(jpeg), base64.StdEncoding.EncodeToString(png)}
+	body := fmt.Sprintf(`{"model":"claude-sonnet-5","max_tokens":100,"messages":[{"role":"user","content":[{"type":"text","text":"private conversation sentinel"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":%q}},{"type":"image","source":{"type":"base64","media_type":"image/png","data":%q}}]},{"role":"assistant","content":"a picture"},{"role":"user","content":"describe it"}]}`, images[0], images[1])
+	var u Usage
+	if code, msg := h.s.serveClaudeSubscription(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, h.p, "claude-sonnet-5", []byte(body), &u); code != 200 {
+		t.Fatalf("%d %s", code, msg)
+	}
+	h.s.subscription.abortAll()
+	var lines []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "images handed over") {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) != 1 {
+		t.Fatalf("want one image inventory, got %v", lines)
+	}
+	for i, raw := range [][]byte{jpeg, png} {
+		found, action := "image/jpeg", "as-is"
+		if i == 1 {
+			found, action = "image/png", "note"
+		}
+		hash := sha256.Sum256(raw)
+		want := fmt.Sprintf(`[%d] declared "image/png" found %q %d bytes 8x8 sha256 %x %s`, i+1, found, len(raw), hash[:4], action)
+		if !strings.Contains(lines[0], want) {
+			t.Fatalf("missing %s in %s", want, lines[0])
+		}
+		if strings.Contains(logs.String(), images[i][:32]) {
+			t.Fatal("image bytes leaked to the log")
+		}
+	}
+	if !strings.Contains(lines[0], "2 images handed over") || strings.Contains(logs.String(), "private conversation sentinel") {
+		t.Fatalf("unsafe or wrong inventory: %s", logs.String())
+	}
+	t.Log(lines[0])
+}
+
+func TestClaudeImageRecordsStayBounded(t *testing.T) {
+	logs := keepLog(t)
+	run := &subscriptionRun{}
+	data := base64.StdEncoding.EncodeToString(replayImage(t, "jpeg"))
+	for i := range 70 {
+		run.noteImages([]Part{{Kind: Image, MediaType: fmt.Sprintf("image/%d", i), Data: data}})
+	}
+	run.mu.Lock()
+	n, dropped := len(run.images), run.imagesDropped
+	first, last := run.images[0].declared, run.images[n-1].declared
+	run.mu.Unlock()
+	if n != 64 || dropped != 6 || first != "image/6" || last != "image/69" {
+		t.Fatalf("records %d dropped %d first %q last %q", n, dropped, first, last)
+	}
+	run.logImages()
+	if !strings.Contains(logs.String(), "70 images handed over (6 not listed)") {
+		t.Fatal(logs.String())
+	}
+}
+
+func TestClaudeImageDeclaredTypeIsBoundedInLogs(t *testing.T) {
+	logs := keepLog(t)
+	declared := strings.Repeat("x", 64) + "hidden-label-tail\n"
+	for _, format := range []string{"png", "bmp"} {
+		raw := replayImage(t, format)
+		if format == "png" {
+			raw = raw[:len(raw)*55/100]
+		}
+		data := base64.StdEncoding.EncodeToString(raw)
+		claudeImage(declared, data)
+		record := claudeImageDetails(declared, data)
+		if len(record.declared) != 64 {
+			t.Fatalf("declared type: %q", record.declared)
+		}
+		sum := sha256.Sum256(raw)
+		if !strings.Contains(logs.String(), fmt.Sprintf("8x8 sha256 %x", sum[:4])) {
+			t.Fatalf("missing dimensions/hash: %s", logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), "hidden-label-tail") {
+		t.Fatal("unbounded declared type in log")
+	}
+}
+
+func TestMediaRemovedLogsToolResultImages(t *testing.T) {
+	logs := keepLog(t)
+	waiter := make(chan mcpToolResult, 1)
+	run := &subscriptionRun{bridge: newSubscriptionBridge(), pending: map[string]chan mcpToolResult{"c1": waiter}}
+	raw := replayImage(t, "jpeg")
+	data := base64.StdEncoding.EncodeToString(raw)
+	segment, err := run.continueWith([]Part{{Kind: ToolResult, CallID: "c1", Images: []Part{{MediaType: "image/png", Data: data}}}}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-waiter
+	if result.Content[1]["mimeType"] != "image/jpeg" {
+		t.Fatalf("tool image: %v", result.Content)
+	}
+	run.readOutput(strings.NewReader(mediaRemovedNotice + "\n" + mediaRemovedResult + "\n"))
+	for range segment {
+	}
+	sum := sha256.Sum256(raw)
+	want := fmt.Sprintf(`1 images handed over: [1] declared "image/png" found "image/jpeg" %d bytes 8x8 sha256 %x as-is`, len(raw), sum[:4])
+	if !strings.Contains(logs.String(), want) {
+		t.Fatalf("missing tool image: %s", logs.String())
 	}
 }
