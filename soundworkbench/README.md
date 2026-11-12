@@ -38,7 +38,7 @@
 
 问题：重放历史消息或传入工具结果时，图片的声明类型与真实字节不符、格式不受支持或文件不完整，会让 Claude Code 拒绝整轮对话。
 
-做法：按字节识别 PNG、JPEG、GIF、WebP；BMP 在总像素不超过 3840x2160 时转成 PNG，TIFF 不解码，和无法读取或超过转换像素上限的图片一样换成一行说明，网关在入口未能转换的 HEIC 也换成一行说明。完整但 Go 无法解码的受支持格式保留给 Anthropic 判断，但 WebP 布局不受支持、找不到可解码帧、帧尺寸与画布不符或转换开销超限时换成说明；正确标注且无需缩放的图片保持原字节。无需转换的 GIF/WebP 不解码；其他解码、缩放和有界编码共用字节预算，超限不转换，繁忙时暂时省略并在下一轮重试，等待超时后短期内缩短后续等待；这次繁忙结果不缓存，其他检查结果缓存，重放不重复解码。Claude Code 的 `media_removed` 若自行继续，就等待重发的回复；若未能回复，则返回 400 `invalid_request_error`，已开始的流发送错误事件，不轮换或休息账号。
+做法：按字节识别 PNG、JPEG、GIF、WebP；BMP 在总像素不超过 3840x2160 时转成 PNG，TIFF 不解码，和无法读取或超过转换像素上限的图片一样换成一行说明，网关在入口未能转换的 HEIC 也换成一行说明。说明会区分图片过大、格式不受支持或文件损坏，并提示如何重发。完整但 Go 无法解码的受支持格式保留给 Anthropic 判断；需要转换但网关无法转换的图片，只要格式受 API 支持、容器完整、宽高已知且均不超过 8000 px、base64 不超过 5 MiB，就保留原字节和真实类型，但一条请求超过 20 张图片时仍可能因超过 2000 px 被拒绝。WebP 头部无法读取、布局不受支持、块结构损坏或顶层帧尺寸与画布不符时换成说明；正确标注且无需缩放的图片保持原字节。无需转换的 GIF/WebP 不解码，结构完整且带动画标记、没有顶层帧的 WebP 动画也保留原字节；其他解码、缩放和有界编码共用字节预算，超限不转换，繁忙时暂时省略并在下一轮重试，等待超时后短期内缩短后续等待；这次繁忙结果不缓存，其他检查结果缓存，重放不重复解码。Claude Code 的 `media_removed` 若自行继续，就等待重发的回复；若未能回复，则返回 400 `invalid_request_error`，已开始的流发送错误事件，不轮换或休息账号。
 
 改动：`internal/gateway/claude_images.go`、`claude_subscription.go`、`internal/claudetui/transcript.go` 及其测试。构建前新增 `ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved`，并测试 `./internal/claudetui/`。当前轮图片粘贴文件的路径不变。
 
