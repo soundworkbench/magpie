@@ -7,6 +7,7 @@ import (
 
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 func TestLoadGuardSpentAnswererStays(t *testing.T) {
@@ -55,6 +56,80 @@ func TestLoadGuardSpentAnswererOriginallyBehind(t *testing.T) {
 				t.Fatalf("nearly spent answerer kept despite original order: %s, %+v", got[0].p.ID, aff)
 			}
 		})
+	}
+}
+
+func TestLoadGuardSpentBusyAnswererWithinTurn(t *testing.T) {
+	for _, off := range []bool{true, false} {
+		t.Run("off="+itoa(boolInt(off)), func(t *testing.T) {
+			loadGuardRouting(t)
+			s := settings.Load()
+			s.LoadGuard.Off = off
+			if err := settings.Save(s); err != nil {
+				t.Fatal(err)
+			}
+			busyLoadAt(t, 80)
+			plugin.ForgetLoads()
+			t.Cleanup(plugin.ForgetLoads)
+			plugin.NoteLoadsForTest("load-plugin", map[string]float64{"m": 95}, time.Now())
+			cs, pl := loadGuardCandidates()
+			cs, pl.order = cs[:2], pl.order[:2]
+			cs[0].p = provider.PluginForTest("load-first", "load-plugin")
+			pl.order[0].Known, pl.order[0].Used = true, 99
+			body := []byte(`{"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"ok"}]}`)
+			h := http.Header{"X-Claude-Code-Session-Id": {t.Name()}}
+			answered(stickKey("group/load", h, body), cs[0], 1, Usage{CacheRead: 5000})
+			cs, pl = restLast(cs, pl)
+			if cs[1].p.ID != "load-first" || pl.order[1].Busy != 95 || pl.order[1].Loaded != "" {
+				t.Fatalf("answerer must be busy but not loaded: %+v", pl.order)
+			}
+			got, _, aff, _ := affine("group/load", "", false, false, false, h, provider.Chat, body, body, cs, pl)
+			if got[0].p.ID != "load-second" || aff.Kept || !aff.Within || aff.Why != "spent" {
+				t.Fatalf("nearly spent busy answerer kept within turn: %s, %+v", got[0].p.ID, aff)
+			}
+		})
+	}
+}
+
+func TestLoadGuardBusyBeforeLoadedFallbackReturnsMain(t *testing.T) {
+	readings := loadGuardRouting(t)
+	busyLoadAt(t, 80)
+	plugin.ForgetLoads()
+	t.Cleanup(plugin.ForgetLoads)
+	plugin.NoteLoadsForTest("load-plugin", map[string]float64{"m": 95}, time.Now())
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	h := http.Header{"X-Claude-Code-Session-Id": {t.Name()}}
+	plan := func() ([]candidate, planned) {
+		cs, pl := loadGuardCandidates()
+		cs[0].p = provider.PluginForTest("load-first", "load-plugin")
+		for i := range cs {
+			cs[i].place = 0 // provider fallbacks have no group place
+		}
+		pl.order[1].Fallback, pl.order[2].Fallback = true, true
+		return restLast(cs, pl)
+	}
+	readings["load-second"] = loadGuardHigh()
+	cs, pl := plan()
+	if cs[0].p.ID != "load-third" || pl.order[1].Busy != 95 || pl.order[2].Loaded == "" {
+		t.Fatalf("expected ready fallback, busy main and loaded fallback: %+v", pl.order)
+	}
+	cs, pl, aff, key := affine("load-first", "", false, false, false, h, provider.Chat, body, body, cs, pl)
+	if aff.Why != "first" {
+		t.Fatalf("fallback was not newly seated: %+v", aff)
+	}
+	answeredStanding(key, cs[0], 1, Usage{CacheRead: 5000}, standsInFor(cs[0], cs, pl.order))
+	sticks.Lock()
+	marked := sticks.m[key].loadChosen
+	sticks.Unlock()
+	if marked {
+		t.Error("busy main's fallback was marked as a load seat")
+	}
+	plugin.NoteLoadsForTest("load-plugin", map[string]float64{"m": 0}, time.Now())
+	clear(readings)
+	cs, pl = plan()
+	cs, _, aff, _ = affine("load-first", "", false, false, false, h, provider.Chat, body, body, cs, pl)
+	if cs[0].p.ID != "load-first" || aff.Kept || aff.Within || aff.Why != "main" {
+		t.Fatalf("loaded fallback hid main recovery: %s %+v", cs[0].p.ID, aff)
 	}
 }
 

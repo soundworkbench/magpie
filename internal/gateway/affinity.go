@@ -670,7 +670,7 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		// its cache as before; within a turn it stays, and Stays:
 		// Session or Strict, the user's own, keep it where it is
 		a.Why = "back"
-	case pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing) && !pl.order[at].CreditsFirst && readyBeforeLoad(cs, pl.order, at):
+	case pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing) && !pl.order[at].CreditsFirst && at > 0 && (pl.order[at].Loaded == "" || readyBeforeLoad(cs, pl.order, at)):
 		// all but used up, and put behind another: first still — the
 		// one key or account it has (#1016), or every one used up — it
 		// doesn't move

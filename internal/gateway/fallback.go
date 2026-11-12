@@ -1275,6 +1275,7 @@ func restLast(out []candidate, pl planned) ([]candidate, planned) {
 			failed = true
 			resting, wResting = append(resting, c), append(wResting, pl.order[i])
 		case isBusy:
+			failed = true
 			pl.order[i].Busy = load
 			busy, wBusy = append(busy, c), append(wBusy, pl.order[i])
 		case pl.order[i].Loaded != "":
