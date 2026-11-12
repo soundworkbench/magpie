@@ -651,13 +651,19 @@ skip loaded candidates; rotation still proceeds when all eligible candidates
 are loaded. If all are loaded their order stays and the request is tried.
 Unlike busy, load never sends an existing conversation away at a new turn.
 Session, turn and cache affinity keep their answerer, including a nearly
-spent answerer moved back solely by load. A new seat (`first`, `gone`,
+spent answerer moved back solely by load. The spent rule still moves an
+answerer that already followed another ready or loaded candidate before load
+deferral; resting, credits-last and busy candidates do not count as that
+earlier alternative. A new seat (`first`, `gone`,
 `no-cache` or `cold`) is remembered as `loadChosen` in `affinity.json` only
 when it passed an overloaded candidate that otherwise belonged in the ready
-bucket: not resting, busy, credits-last, aside or reserved. An existing
+bucket: not resting, busy, credits-last, aside or reserved. If a resting or
+credits-last candidate preceded the chosen seat in the original order, the
+seat is already a failure backup and receives no load mark. An existing
 conversation does not acquire this mark just because a preceding candidate
 becomes overloaded. A marked seat stays when load clears, including across
-restarts; a real failure clears that exemption. Return to a recovered main
+restarts; an earlier candidate resting or going onto credits-last clears that
+exemption, but temporary plugin busy load does not. Return to a recovered main
 or from a stand-in still applies even if the backup is overloaded. Existing
 rest, quota and explicit affinity rules continue to apply. Disabling the guard
 ignores this memory of load deferral and restores the prior routing decisions.

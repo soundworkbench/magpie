@@ -36,6 +36,28 @@ func TestLoadGuardSpentAnswererStays(t *testing.T) {
 	}
 }
 
+func TestLoadGuardSpentAnswererOriginallyBehind(t *testing.T) {
+	for _, loaded := range []bool{false, true} {
+		t.Run(itoa(boolInt(loaded)), func(t *testing.T) {
+			readings := loadGuardRouting(t)
+			cs, pl := loadGuardCandidates()
+			// Smart already preferred the first candidate before load was read.
+			pl.order[1].Known, pl.order[1].Used = true, 99
+			body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+			h := http.Header{"X-Claude-Code-Session-Id": {t.Name()}}
+			answered(stickKey("group/load", h, body), cs[1], 1, Usage{CacheRead: 5000})
+			if loaded {
+				readings[cs[1].p.ID] = loadGuardHigh()
+			}
+			cs, pl = restLast(cs, pl)
+			got, _, aff, _ := affine("group/load", "", false, false, false, h, provider.Chat, body, body, cs, pl)
+			if got[0].p.ID != "load-first" || aff.Kept || aff.Why != "spent" {
+				t.Fatalf("nearly spent answerer kept despite original order: %s, %+v", got[0].p.ID, aff)
+			}
+		})
+	}
+}
+
 func TestLoadGuardFailureRecovery(t *testing.T) {
 	for _, route := range []string{"fallback", "order", "stand-in"} {
 		for _, stillLoaded := range []bool{false, true} {
@@ -85,6 +107,69 @@ func TestLoadGuardFailureRecovery(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestLoadGuardFailureBeforeLoadedFallbackReturnsMain(t *testing.T) {
+	readings := loadGuardRouting(t)
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	h := http.Header{"X-Claude-Code-Session-Id": {t.Name()}}
+	plan := func() ([]candidate, planned) {
+		cs, pl := loadGuardCandidates()
+		for i := range cs {
+			cs[i].place = 0 // provider fallbacks have no group place
+		}
+		pl.order[1].Fallback, pl.order[2].Fallback = true, true
+		return restLast(cs, pl)
+	}
+	main, _ := loadGuardCandidates()
+	loadGuardRest(main[0])
+	readings["load-second"] = loadGuardHigh()
+	cs, pl := plan()
+	cs, pl, aff, key := affine("load-first", "", false, false, false, h, provider.Chat, body, body, cs, pl)
+	if cs[0].p.ID != "load-third" || aff.Why != "first" {
+		t.Fatalf("fallback was not seated: %s %+v", cs[0].p.ID, aff)
+	}
+	answeredStanding(key, cs[0], 1, Usage{CacheRead: 5000}, standsInFor(cs[0], cs, pl.order))
+	// No request observes the main still resting after the first answer.
+	restingUntil.Lock()
+	delete(restingUntil.m, main[0].restKey())
+	restingUntil.Unlock()
+	clear(readings)
+	cs, pl = plan()
+	cs, _, aff, _ = affine("load-first", "", false, false, false, h, provider.Chat, body, body, cs, pl)
+	if cs[0].p.ID != "load-first" || aff.Why != "main" {
+		t.Fatalf("loaded fallback hid main recovery: %s %+v", cs[0].p.ID, aff)
+	}
+}
+
+func TestLoadGuardSeatSurvivesTemporaryBusy(t *testing.T) {
+	readings := loadGuardRouting(t)
+	busyLoadAt(t, 80)
+	plugin.ForgetLoads()
+	t.Cleanup(plugin.ForgetLoads)
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	h := http.Header{"X-Claude-Code-Session-Id": {t.Name()}}
+	readings["load-first"] = loadGuardHigh()
+	for turn := 1; turn <= 3; turn++ {
+		switch turn {
+		case 2:
+			plugin.NoteLoadsForTest("load-plugin", map[string]float64{"m": 95}, time.Now())
+		case 3:
+			plugin.NoteLoadsForTest("load-plugin", map[string]float64{"m": 0}, time.Now())
+			clear(readings)
+		}
+		cs, pl := loadGuardCandidates()
+		cs[0].p = provider.PluginForTest("load-first", "load-plugin")
+		cs, pl = restLast(cs, pl)
+		if turn == 2 && (cs[2].p.ID != "load-first" || pl.order[2].Busy != 95) {
+			t.Fatalf("first member was not busy: %+v", pl.order)
+		}
+		cs, pl, aff, key := affine("group/load", "", false, false, true, h, provider.Chat, body, body, cs, pl)
+		if cs[0].p.ID != "load-second" || turn > 1 && (!aff.Kept || aff.Why != "cache") {
+			t.Fatalf("turn %d: temporary busy lost load seat: %s %+v", turn, cs[0].p.ID, aff)
+		}
+		answeredStanding(key, cs[0], turn, Usage{CacheRead: 5000}, standsInFor(cs[0], cs, pl.order))
 	}
 }
 

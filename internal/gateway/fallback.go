@@ -1253,7 +1253,7 @@ func restLast(out []candidate, pl planned) ([]candidate, planned) {
 	now := time.Now()
 	over := settings.Shared().BusyLoad
 	guard := settings.LoadGuardNow()
-	deferred := false
+	deferred, failed := false, false
 	var ready, busy, loaded, resting, last []candidate
 	var wReady, wBusy, wLoaded, wResting, wLast []Weighed
 	for i := range out {
@@ -1268,9 +1268,11 @@ func restLast(out []candidate, pl planned) ([]candidate, planned) {
 		load, isBusy := busyOf(c, over, now)
 		switch {
 		case c.creditsLast(now):
+			failed = true
 			pl.order[i].CreditsLast = true
 			last, wLast = append(last, c), append(wLast, pl.order[i])
 		case isResting:
+			failed = true
 			resting, wResting = append(resting, c), append(wResting, pl.order[i])
 		case isBusy:
 			pl.order[i].Busy = load
@@ -1283,7 +1285,9 @@ func restLast(out []candidate, pl planned) ([]candidate, planned) {
 			}
 			loaded, wLoaded = append(loaded, c), append(wLoaded, pl.order[i])
 		default:
-			c.loadChosen = deferred && !pl.order[i].Aside && pl.order[i].Reserve == 0
+			// A failure earlier in the original order already makes this
+			// a backup, even when another predecessor was deferred by load.
+			c.loadChosen = deferred && !failed && !pl.order[i].Aside && pl.order[i].Reserve == 0
 			ready, wReady = append(ready, c), append(wReady, pl.order[i])
 		}
 	}

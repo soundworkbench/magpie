@@ -582,7 +582,7 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 	// whose candidates have no group place for standsInFor to remember.
 	if st.loadChosen && at >= 0 && at < len(pl.order) {
 		for i, w := range pl.order {
-			if i < len(cs) && cs[i].loadOrder < cs[at].loadOrder && (w.Rest != nil || w.CreditsLast || w.Busy > 0) {
+			if i < len(cs) && cs[i].loadOrder < cs[at].loadOrder && (w.Rest != nil || w.CreditsLast) {
 				st.loadChosen = false
 				break
 			}
@@ -670,7 +670,7 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		// its cache as before; within a turn it stays, and Stays:
 		// Session or Strict, the user's own, keep it where it is
 		a.Why = "back"
-	case at > 0 && pl.order[at].Loaded == "" && pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing) && !pl.order[at].CreditsFirst:
+	case pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing) && !pl.order[at].CreditsFirst && readyBeforeLoad(cs, pl.order, at):
 		// all but used up, and put behind another: first still — the
 		// one key or account it has (#1016), or every one used up — it
 		// doesn't move
@@ -741,6 +741,18 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		}
 	}
 	return cs, pl, a, key
+}
+
+// readyBeforeLoad says whether another ready or loaded candidate preceded
+// the answerer before load deferral. Load alone must neither trigger nor
+// suppress moving a nearly spent answerer to an earlier candidate.
+func readyBeforeLoad(cs []candidate, order []Weighed, at int) bool {
+	for j, w := range order {
+		if j != at && j < len(cs) && w.Rest == nil && !w.CreditsLast && w.Busy == 0 && cs[j].loadOrder < cs[at].loadOrder {
+			return true
+		}
+	}
+	return false
 }
 
 // backToMain says whether the one that answered last, order[at], is a
