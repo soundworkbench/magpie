@@ -145,7 +145,7 @@ func TestClaudeImageGIFTruncatedSecondFrameIsOmitted(t *testing.T) {
 		t.Fatal("second frame must be incomplete")
 	}
 	mt, data, note := claudeImage("image/gif", base64.StdEncoding.EncodeToString(raw))
-	if mt != "" || data != "" || note != claudeImageOmitted {
+	if mt != "" || data != "" || !strings.Contains(note, "damaged") {
 		t.Fatalf("truncated GIF passed: %q, note %q", mt, note)
 	}
 }
@@ -157,7 +157,7 @@ func TestClaudeImagePNGWithoutIENDIsOmitted(t *testing.T) {
 	}
 	raw = raw[:len(raw)-12]
 	mt, data, note := claudeImage("image/png", base64.StdEncoding.EncodeToString(raw))
-	if mt != "" || data != "" || note != claudeImageOmitted {
+	if mt != "" || data != "" || !strings.Contains(note, "damaged") {
 		t.Fatalf("PNG without IEND passed: %q, note %q", mt, note)
 	}
 }
@@ -175,9 +175,13 @@ func TestClaudeImageBrokenOrUnreadable(t *testing.T) {
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
+			problem := "format is not supported"
+			if strings.HasPrefix(name, "truncated") || name == "invalid base64" {
+				problem = "damaged"
+			}
 			for range 2 {
 				mt, d, note := claudeImage("image/png", data)
-				if mt != "" || d != "" || note != claudeImageOmitted {
+				if mt != "" || d != "" || !strings.Contains(note, problem) {
 					t.Fatalf("got %q, %q, %q", mt, d, note)
 				}
 			}
@@ -222,7 +226,7 @@ func TestClaudeImageCompleteAnimationWithoutDecodableFrame(t *testing.T) {
 	}
 	data := base64.StdEncoding.EncodeToString(raw)
 	mt, d, note := claudeImage("image/png", data)
-	if mt != "" || d != "" || note != claudeImageOmitted {
+	if mt != "image/webp" || d != data || note != "" {
 		t.Fatalf("got %q, unchanged %v, note %q", mt, d == data, note)
 	}
 }
@@ -288,7 +292,7 @@ func TestClaudeReplayImagesInTranscript(t *testing.T) {
 						t.Fatalf("wrong image: %v", src)
 					}
 				}
-				if block["type"] == "text" && block["text"] == claudeImageOmitted {
+				if block["type"] == "text" && strings.Contains(fmt.Sprint(block["text"]), "damaged") {
 					notes++
 				}
 			}
@@ -322,7 +326,7 @@ func TestClaudeImageMCPResult(t *testing.T) {
 		}
 		got := result.Content[1]
 		if broken {
-			if got["type"] != "text" || got["text"] != claudeImageOmitted {
+			if got["type"] != "text" || !strings.Contains(fmt.Sprint(got["text"]), "damaged") {
 				t.Fatalf("broken image: %v", got)
 			}
 		} else if got["type"] != "image" || got["mimeType"] != "image/jpeg" || got["data"] != data {
@@ -342,7 +346,7 @@ func TestClaudeImageThumbnailDoesNotEndATruncatedJPEG(t *testing.T) {
 		t.Fatal("fixture must be incomplete")
 	}
 	mt, data, note := claudeImage("image/jpeg", base64.StdEncoding.EncodeToString(raw))
-	if mt != "" || data != "" || note != claudeImageOmitted {
+	if mt != "" || data != "" || !strings.Contains(note, "damaged") {
 		t.Fatalf("truncated JPEG passed: %q, note %q", mt, note)
 	}
 }
@@ -355,7 +359,7 @@ func TestClaudeImageCacheSeparatesTheDeclaredType(t *testing.T) {
 		t.Fatalf("valid image: %q, %q", mt, note)
 	}
 	mt, d, note = claudeImage("image/png", "charset=binary;"+data)
-	if mt != "" || d != "" || note != claudeImageOmitted {
+	if mt != "" || d != "" || !strings.Contains(note, "damaged") {
 		t.Fatal("invalid base64 borrowed the valid image's verdict")
 	}
 }
@@ -462,6 +466,7 @@ func TestClaudeImageDeclaredTypeIsBoundedInLogs(t *testing.T) {
 			raw = raw[:len(raw)*55/100]
 		}
 		data := base64.StdEncoding.EncodeToString(raw)
+		claudeImageClearFixture(t, declared, data)
 		claudeImage(declared, data)
 		record := claudeImageDetails(declared, data)
 		if len(record.declared) != 64 {

@@ -126,7 +126,7 @@ func TestClaudeImageThatFitsGoesAsItCame(t *testing.T) {
 	if mt, d, note := claudeImage("image/jpeg", small); mt != "image/jpeg" || d != small || note != "" {
 		t.Fatal("an image within 2000 px was written again")
 	}
-	if mt, d, note := claudeImage("image/png", "bm90IGFuIGltYWdl"); mt != "" || d != "" || note != claudeImageOmitted {
+	if mt, d, note := claudeImage("image/png", "bm90IGFuIGltYWdl"); mt != "" || d != "" || !strings.Contains(note, "format is not supported") {
 		t.Fatal("bytes that are not an image were not replaced by a note")
 	}
 }
