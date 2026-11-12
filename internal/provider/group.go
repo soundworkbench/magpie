@@ -1088,6 +1088,28 @@ func GroupFor(id string) (string, bool) {
 	return groupForIn(Groups(), id)
 }
 
+// PrefixedGroupFor finds a group behind a client's vendor prefix when
+// that prefix names no enabled provider. Exact catalog ids keep Resolve's
+// priority. The gateway must still check the key's access to the group
+// and keep the original id when that group is not allowed.
+func PrefixedGroupFor(id string) (string, bool) {
+	id = strings.TrimSuffix(strings.TrimSpace(id), "[1m]")
+	pid, model, ok := strings.Cut(id, "/")
+	if !ok || pid == "" || IsGroupRef(id) {
+		return "", false
+	}
+	if p := lookIn(sharedAll(), pid); p != nil && p.On() {
+		return "", false
+	}
+	entries := providerEntries()
+	for i := range entries {
+		if entries[i].ID == id {
+			return "", false
+		}
+	}
+	return GroupFor(model)
+}
+
 // groupForIn is GroupFor over the groups all, read once for many ids.
 func groupForIn(all []Group, id string) (string, bool) {
 	k := Slug(sameModel(id))

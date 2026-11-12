@@ -330,9 +330,16 @@ func foundGroup(g provider.Group) bool {
 // model it may use, is that model for the key, as it would be were there
 // no such group — the key is held away from the group, not from the model
 // (a group the user named gemini-3.8, a key given google/gemini-3.8
-// asking for gemini-3.8). Every other name is GroupFor's.
+// asking for gemini-3.8). A vendor prefix naming no enabled provider can
+// also name a group (PrefixedGroupFor), but only when the key may use it;
+// otherwise the original prefixed id keeps its existing resolution.
 func keyGroupFor(r *http.Request, id string) (string, bool) {
 	gid, ok := provider.GroupFor(id)
+	prefixed := false
+	if !ok {
+		gid, ok = provider.PrefixedGroupFor(id)
+		prefixed = ok
+	}
 	if !ok {
 		return gid, ok
 	}
@@ -340,7 +347,11 @@ func keyGroupFor(r *http.Request, id string) (string, bool) {
 	if !held && !withGatewayKey(r) {
 		return gid, true
 	}
-	if g, ms, found := provider.FindGroup(gid); !found || groupGiven(r, who, held, g, ms) {
+	g, ms, found := provider.FindGroup(gid)
+	if prefixed {
+		return gid, found && groupGiven(r, who, held, g, ms)
+	}
+	if !found || groupGiven(r, who, held, g, ms) {
 		return gid, true
 	}
 	if p, model, served := provider.Resolve(id); served && !provider.IsGroupRef(id) && (!held || modelAllowed(who, p, model)) {

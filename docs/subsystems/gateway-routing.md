@@ -2596,6 +2596,23 @@ only `codex/gpt-5.6-sol`. A bare request already routes (Model resolution,
 above); the list didn't offer it. "Provider in model names" (`PlainNames`)
 changes labels only, never ids.
 
+A client may also send a vendor prefix, such as
+`claude/claude-opus-5-5`, to an entry gateway whose providers are `rm-q`
+and `rm-s`. `provider.PrefixedGroupFor` in
+[`group.go`](../../internal/provider/group.go) lets the suffix name a
+routing group through `GroupFor` when the prefix names no enabled
+provider (including names and `was` aliases), and the full id is not an
+exact provider catalog entry. `keyGroupFor` in
+[`key_models.go`](../../internal/gateway/key_models.go) applies this to
+requests and token-count permissions only when the key may use that
+group. Otherwise the original id keeps its existing resolution and
+permissions. Ids of enabled providers, exact mapped catalog ids and names
+with no matching group keep their resolution. Group requests appear under the
+group in routing logs and under the serving member in usage, as a bare
+request does. `TestPrefixedModelGroup` in
+[`group_prefix_test.go`](../../internal/gateway/group_prefix_test.go)
+covers the prefix, alias, mapping and key-permission cases.
+
 Settings › Network and sharing › Model ids without the provider,
 `POST /api/settings/bare-ids` (`settings.BareModelIDs`,
 `provider.SetBareModelIDs`), off by default. On, `models` lists every row
