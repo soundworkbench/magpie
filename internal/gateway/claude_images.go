@@ -50,8 +50,8 @@ import (
 // the gateway did not convert at the door, any other format, or an
 // incomplete or unreadable image goes as a note. Complete supported
 // containers Go cannot decode go to Anthropic unchanged, with their real
-// type, except for unsafe WebP layouts. An image needing a refit that
-// the gateway cannot do goes as it came when it is complete,
+// type, except for unsafe WebP layouts or unreadable WebP headers. An image
+// needing a refit that the gateway cannot do goes as it came when it is complete,
 // has an API type, and fits 8000 px a side and 5 MiB of base64. A request
 // with more than 20 images may still be refused: its images must fit 2000 px.
 // Complete GIF/WebP images that fit are not decoded; well-formed animated
@@ -621,7 +621,7 @@ func claudeImageHolds(cfg image.Config, format string, raw []byte) (int, bool) {
 		}
 	case "webp":
 		f, ok := claudeImageWebPFrame(raw)
-		if !ok || f.width != cfg.Width || f.height != cfg.Height {
+		if !ok || f.noFrame || f.width != cfg.Width || f.height != cfg.Height {
 			return holdsMost, false
 		}
 		if f.lossless {
@@ -802,7 +802,7 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 		}
 	}
 	if headerErr != nil {
-		if claudeImageComplete(mt, raw) {
+		if mt != "image/webp" && claudeImageComplete(mt, raw) {
 			return fitEntry{mime: mt}, true
 		}
 		return omit("unreadable image header", "damaged", len(raw)), true
@@ -824,7 +824,10 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 	unconverted := func(reason string) fitEntry {
 		switch mt {
 		case "image/png", "image/jpeg", "image/gif", "image/webp":
-			if headerErr == nil && cfg.Width > 0 && cfg.Height > 0 && cfg.Width <= claudeImageAPISide && cfg.Height <= claudeImageAPISide && len(data) <= claudeImageBase64 && claudeImageComplete(mt, raw) {
+			if !claudeImageComplete(mt, raw) {
+				return omit("incomplete image container", "damaged", len(raw))
+			}
+			if headerErr == nil && cfg.Width > 0 && cfg.Height > 0 && cfg.Width <= claudeImageAPISide && cfg.Height <= claudeImageAPISide && len(data) <= claudeImageBase64 {
 				log.Printf("claude: image needs a refit the gateway cannot do; sent as it came (declared %q, found %q, %d bytes): %s; %dx%d sha256 %s", declared, mt, len(raw), reason, record.width, record.height, record.hash)
 				return fitEntry{mime: mt}
 			}

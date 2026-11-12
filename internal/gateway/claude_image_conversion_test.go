@@ -434,8 +434,12 @@ func TestClaudeImageProgressiveJPEGCountsCoefficients(t *testing.T) {
 			runtime.ReadMemStats(&after)
 			allocated := after.TotalAlloc - before.TotalAlloc
 			t.Logf("allocated %d bytes; type %q, image %t, note %q; %s", allocated, mt, data != "", note, strings.TrimSpace(logs.String()))
-			if mt != "" || data != "" || !strings.Contains(note, "too large") || !strings.Contains(logs.String(), "image too large to convert") {
-				t.Error("progressive JPEG was not refused for its decode cost")
+			problem, reason := "too large", "image too large to convert"
+			if tc.stray {
+				problem, reason = "damaged", "incomplete image container"
+			}
+			if mt != "" || data != "" || !strings.Contains(note, problem) || !strings.Contains(logs.String(), reason) {
+				t.Error("progressive JPEG was not refused with the expected reason")
 			}
 			if allocated >= 8<<20 {
 				t.Errorf("progressive refusal allocated %d bytes, want less than 8 MiB", allocated)
@@ -1130,6 +1134,69 @@ func TestClaudeImageAnimatedWebPFitsGoesAsItCame(t *testing.T) {
 		if mt != "" || data != "" || !strings.Contains(note, "damaged") || after.TotalAlloc-before.TotalAlloc >= 8<<20 {
 			t.Fatalf("malformed animation: type %q, note %q, allocated %d", mt, note, after.TotalAlloc-before.TotalAlloc)
 		}
+	}
+}
+
+func TestClaudeImageAnimatedWebPUnreadableHeaderIsNoted(t *testing.T) {
+	raw := replayAnimation(t)
+	// A 65536x32768 canvas fits WebP's area limit, but exceeds the
+	// decoder's MaxInt32 limit. The animation chunks remain intact.
+	copy(raw[24:27], []byte{0xff, 0xff, 0})
+	copy(raw[27:30], []byte{0xff, 0x7f, 0})
+	if _, _, err := image.DecodeConfig(bytes.NewReader(raw)); err == nil {
+		t.Fatal("fixture must have an unreadable header")
+	}
+	if f, ok := claudeImageWebPFrame(raw); !ok || !f.noFrame || !claudeImageComplete("image/webp", raw) {
+		t.Fatal("fixture must be a complete animation without a top-level frame")
+	}
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	claudeImageClearFixture(t, "image/webp", encoded)
+	if !claudeImageDecodeBudget.acquire(codexImageMaxBytes, time.Second) {
+		t.Fatal("budget occupied")
+	}
+	defer claudeImageDecodeBudget.release(codexImageMaxBytes)
+	mt, data, note := claudeImage("image/webp", encoded)
+	if mt != "" || data != "" || !strings.Contains(note, "damaged") {
+		t.Fatalf("unreadable animation: type %q, note %q", mt, note)
+	}
+}
+
+func TestClaudeImageHoldsRejectsWebPWithoutFrame(t *testing.T) {
+	raw := replayAnimation(t)
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, ok := claudeImageWebPFrame(raw); !ok || !f.noFrame {
+		t.Fatal("fixture must have no top-level frame")
+	}
+	if _, ok := claudeImageHolds(cfg, format, raw); ok {
+		t.Fatal("animation without a frame counted as decodable")
+	}
+}
+
+func TestClaudeImageRefitPNGWithoutIENDIsDamaged(t *testing.T) {
+	var b bytes.Buffer
+	if err := png.Encode(&b, image.NewGray(image.Rect(0, 0, 2400, 1))); err != nil {
+		t.Fatal(err)
+	}
+	raw := b.Bytes()[:b.Len()-12]
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || cfg.Width <= claudeImageSide || claudeImageComplete("image/png", raw) {
+		t.Fatalf("fixture must need refitting and lack IEND: %v", err)
+	}
+	holds, ok := claudeImageHolds(cfg, format, raw)
+	if !ok || claudeImageDecodeWeight(cfg, holds, true) > codexImageMaxBytes || holds > claudeImageDecodeLimit-len(raw) {
+		t.Fatal("fixture must reach image.Decode")
+	}
+	if _, _, err := image.Decode(bytes.NewReader(raw)); err == nil {
+		t.Fatal("fixture must fail image.Decode")
+	}
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	claudeImageClearFixture(t, "image/png", encoded)
+	mt, data, note := claudeImage("image/png", encoded)
+	if mt != "" || data != "" || !strings.Contains(note, "2400x1 PNG") || !strings.Contains(note, "damaged") || strings.Contains(note, "too large") {
+		t.Fatalf("incomplete refit PNG: type %q, note %q", mt, note)
 	}
 }
 
