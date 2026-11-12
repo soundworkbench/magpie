@@ -2,16 +2,20 @@ name: Test
 
 on:
   push:
-    branches: [main]
+    branches: [main, local, local-3492]
   pull_request:
   workflow_dispatch:
 
 # On main a run finishes: a release waits for a green run, and one cancelled
 # by every next push left none to wait for (LESSONS.md). A newer push still
-# replaces a run that hasn't started. A PR's run is cancelled by its next push.
+# replaces a run that hasn't started. Pushes to local and local-3492 also
+# finish once started. A PR's run is cancelled by its next push.
 concurrency:
   group: test-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: >-
+    ${{ github.ref != 'refs/heads/main' &&
+        !(github.event_name == 'push' &&
+          (github.ref == 'refs/heads/local' || github.ref == 'refs/heads/local-3492')) }}
 
 permissions:
   contents: read
@@ -21,9 +25,12 @@ jobs:
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
+      # This fork ships Linux only; macOS/Windows stay as non-blocking
+      # upstream reference checks.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
 
     steps:
       - uses: actions/checkout@v4
