@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/webp"
@@ -58,15 +59,20 @@ const (
 // 24 bytes a pixel is about 190 MiB, within the 320 MiB decode budget.
 const claudeImageConvertPixels = 3840 * 2160
 
-// This file registers the BMP decoder that clients feed, so its conversions
-// run one at a time, including the refit that still holds the decoded image.
-var claudeImageConvertMu sync.Mutex
+// One BMP conversion runs at a time, including the refit. A conversion
+// that cannot get the slot within the wait is given up, so a queue cannot
+// hold requests and their bytes without bound.
+var (
+	claudeImageConvertSlot = make(chan struct{}, 1)
+	claudeImageConvertWait = 20 * time.Second
+)
 
 // claudeImageLimits keys the images claudeImage made in fitted, apart
 // from Codex's.
 var claudeImageLimits = imageLimits{side: claudeImageSide, patches: -1}
 
 const claudeImageOmitted = "[An image was left out: the gateway could not read it]"
+const claudeImageOmittedTIFF = "[An image was left out: TIFF images are not supported here; send it as PNG or JPEG]"
 
 // claudeImage is the real media type and base64 sent to Claude Code, or
 // a note in their place. A cached verdict includes the declared type:
@@ -74,6 +80,9 @@ const claudeImageOmitted = "[An image was left out: the gateway could not read i
 func claudeImage(mediaType, data string) (string, string, string) {
 	e, _ := claudeImageVerdict(mediaType, data)
 	if e.mime == "text/plain" {
+		if len(e.data) != 0 {
+			return "", "", string(e.data)
+		}
 		return "", "", claudeImageOmitted
 	}
 	if e.data == nil {
@@ -102,8 +111,11 @@ func claudeImageVerdict(declared, data string) (fitEntry, claudeImageRecord) {
 	claudeImageRecords.Unlock()
 	e, ok := fitted.get(key)
 	if !ok {
-		e = claudeImageChecked(declared, data, &record)
-		fitted.put(key, e)
+		var keep bool
+		e, keep = claudeImageChecked(declared, data, &record)
+		if keep {
+			fitted.put(key, e)
+		}
 	} else if !recorded {
 		// The verdict can outlive its record. Read only the header and
 		// hash the bytes again, never decode the pixels a second time.
@@ -130,7 +142,14 @@ func claudeImageVerdict(declared, data string) (fitEntry, claudeImageRecord) {
 }
 
 func claudeImageDetails(declared, data string) claudeImageRecord {
-	_, record := claudeImageVerdict(declared, data)
+	key := fitKey(strconv.Itoa(len(declared))+":"+declared+data, claudeImageLimits)
+	claudeImageRecords.Lock()
+	record, ok := claudeImageRecords.m[key]
+	claudeImageRecords.Unlock()
+	if ok {
+		return record
+	}
+	_, record = claudeImageVerdict(declared, data)
 	return record
 }
 
@@ -301,7 +320,7 @@ func claudeJPEGComplete(raw []byte) bool {
 	return false
 }
 
-func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEntry {
+func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEntry, bool) {
 	declared = strings.Clone(declared[:min(len(declared), 64)])
 	mt := ""
 	*record = claudeImageRecord{declared: declared}
@@ -312,7 +331,7 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEnt
 	if len(data) > codexImageMaxBytes {
 		*record = claudeImageReadRecord(declared, data)
 		mt = record.found
-		return omit("image exceeds the read limit", base64.StdEncoding.DecodedLen(len(data)))
+		return omit("image exceeds the read limit", base64.StdEncoding.DecodedLen(len(data))), true
 	}
 	raw, err := base64.StdEncoding.DecodeString(data)
 	sum := sha256.Sum256(raw)
@@ -320,9 +339,11 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEnt
 	if claudeImageTIFF(raw) {
 		record.found, mt = "image/tiff", "image/tiff"
 		if err != nil {
-			return omit("invalid base64", len(raw))
+			return omit("invalid base64", len(raw)), true
 		}
-		return omit("TIFF is not converted", len(raw))
+		e := omit("TIFF is not converted", len(raw))
+		e.data = []byte(claudeImageOmittedTIFF)
+		return e, true
 	}
 	cfg, format, headerErr := image.DecodeConfig(bytes.NewReader(raw))
 	if headerErr == nil {
@@ -333,53 +354,59 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEnt
 		record.found = "image/" + format
 	}
 	if err != nil {
-		return omit("invalid base64", len(raw))
+		return omit("invalid base64", len(raw)), true
 	}
 	// GIF decoding stops at the first frame; WebP may promise more chunks.
 	// PNG and JPEG decoding reads to the end of the image itself.
 	if (mt == "image/gif" || mt == "image/webp") && !claudeImageComplete(mt, raw) {
-		return omit("incomplete image container", len(raw))
+		return omit("incomplete image container", len(raw)), true
 	}
 	if headerErr != nil {
 		if claudeImageComplete(mt, raw) {
-			return fitEntry{mime: mt}
+			return fitEntry{mime: mt}, true
 		}
-		return omit("unreadable image header", len(raw))
+		return omit("unreadable image header", len(raw)), true
 	}
 	if format == "bmp" && cfg.Width > 0 && cfg.Height > 0 && (cfg.Width > claudeImageConvertPixels || cfg.Height > claudeImageConvertPixels/cfg.Width) {
-		return omit("image too large to convert", len(raw))
+		return omit("image too large to convert", len(raw)), true
 	}
 	holds, ok := imageHolds(cfg, format)
 	if !ok || holds > codexImageMaxBytes-len(raw) {
 		if claudeImageComplete(mt, raw) {
-			return fitEntry{mime: mt}
+			return fitEntry{mime: mt}, true
 		}
-		return omit("image exceeds the decode limit", len(raw))
+		return omit("image exceeds the decode limit", len(raw)), true
 	}
 	if format == "bmp" {
-		claudeImageConvertMu.Lock()
-		defer claudeImageConvertMu.Unlock()
+		timer := time.NewTimer(claudeImageConvertWait)
+		defer timer.Stop()
+		select {
+		case claudeImageConvertSlot <- struct{}{}:
+			defer func() { <-claudeImageConvertSlot }()
+		case <-timer.C:
+			return omit("conversion slot busy", len(raw)), false
+		}
 	}
 	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		if claudeImageComplete(mt, raw) {
-			return fitEntry{mime: mt}
+			return fitEntry{mime: mt}, true
 		}
-		return omit("unreadable image", len(raw))
+		return omit("unreadable image", len(raw)), true
 	}
 	if mt != "" && cfg.Width <= claudeImageSide && cfg.Height <= claudeImageSide && len(data) <= claudeImageBase64 {
-		return fitEntry{mime: mt}
+		return fitEntry{mime: mt}, true
 	}
 	e := claudeImageRefit(src, cfg, format)
 	if e.data == nil {
-		return omit("image could not be re-encoded", len(raw))
+		return omit("image could not be re-encoded", len(raw)), true
 	}
 	reason := "image exceeds inline limits"
 	if mt == "" {
 		reason = "unsupported image type"
 	}
 	log.Printf("claude: image re-encoded as %s (declared %q, found %q, %d bytes): %s; %dx%d sha256 %s", e.mime, declared, "image/"+format, len(raw), reason, record.width, record.height, record.hash)
-	return e
+	return e, true
 }
 
 // claudeImageRefit scales a decoded image and writes it within the limits.
