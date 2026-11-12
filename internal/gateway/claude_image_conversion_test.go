@@ -8,9 +8,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
+	"io"
+	"os"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,6 +53,14 @@ func TestClaudeImageTIFFIsNotConverted(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := keepLog(t)
 			encoded := base64.StdEncoding.EncodeToString(tc.raw)
+			key := fitKey(fmt.Sprintf("%d:%s%s", len(tc.declared), tc.declared, encoded), claudeImageLimits)
+			t.Cleanup(func() {
+				fitted.Lock()
+				defer fitted.Unlock()
+				if el := fitted.m[key]; el != nil {
+					fitted.drop(el)
+				}
+			})
 			mt, data, note := claudeImage(tc.declared, encoded)
 			record := claudeImageDetails(tc.declared, encoded)
 			t.Logf("type %q, image %t, note %q; record %+v; %s", mt, data != "", note, record, strings.TrimSpace(logs.String()))
@@ -69,6 +82,14 @@ func TestClaudeImageTIFFIsNotConverted(t *testing.T) {
 	t.Run("invalid base64", func(t *testing.T) {
 		logs := keepLog(t)
 		encoded := base64.StdEncoding.EncodeToString(valid) + "%"
+		key := fitKey("10:image/tiff"+encoded, claudeImageLimits)
+		t.Cleanup(func() {
+			fitted.Lock()
+			defer fitted.Unlock()
+			if el := fitted.m[key]; el != nil {
+				fitted.drop(el)
+			}
+		})
 		for range 2 {
 			mt, data, note := claudeImage("image/tiff", encoded)
 			if mt != "" || data != "" || note != claudeImageOmitted {
@@ -80,6 +101,97 @@ func TestClaudeImageTIFFIsNotConverted(t *testing.T) {
 			t.Error("missing invalid base64 reason")
 		}
 	})
+}
+
+func TestClaudeImageHEICIsNotDecoded(t *testing.T) {
+	raw, err := os.ReadFile("testdata/opaque.heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || format != "heic" {
+		t.Fatalf("registered decoder: format %q, config %+v, error %v", format, cfg, err)
+	}
+	t.Logf("registered decoder: %s, %dx%d", format, cfg.Width, cfg.Height)
+	const wantNote = "[An image was left out: this HEIC image could not be converted; send it as PNG or JPEG]"
+	for _, declared := range []string{"image/heic", "image/png"} {
+		t.Run(declared, func(t *testing.T) {
+			encoded := base64.StdEncoding.EncodeToString(raw)
+			key := fitKey(fmt.Sprintf("%d:%s%s", len(declared), declared, encoded), claudeImageLimits)
+			t.Cleanup(func() {
+				fitted.Lock()
+				defer fitted.Unlock()
+				if el := fitted.m[key]; el != nil {
+					fitted.drop(el)
+				}
+			})
+			logs := keepLog(t)
+			mt, data, note := claudeImage(declared, encoded)
+			record := claudeImageDetails(declared, encoded)
+			t.Logf("type %q, image %t, note %q; record %+v; %s", mt, data != "", note, record, strings.TrimSpace(logs.String()))
+			if mt != "" || data != "" || note != wantNote {
+				t.Error("HEIC was not replaced by the note")
+			}
+			if mt, data, note := claudeImage(declared, encoded); mt != "" || data != "" || note != wantNote {
+				t.Error("cached HEIC verdict lost its note")
+			}
+			if !strings.Contains(logs.String(), "HEIC is not converted here") {
+				t.Error("missing HEIC refusal reason")
+			}
+			sum := sha256.Sum256(raw)
+			if record.found != "image/heic" || record.action != "note" || record.bytes != len(raw) || record.hash != fmt.Sprintf("%x", sum[:4]) || record.width != 0 || record.height != 0 {
+				t.Error("HEIC record lost its type, action, bytes or hash, or read its dimensions")
+			}
+			record = claudeImageReadRecord(declared, encoded)
+			t.Logf("read record: %+v", record)
+			if record.found != "image/heic" || record.bytes != len(raw) || record.hash != fmt.Sprintf("%x", sum[:4]) || record.width != 0 || record.height != 0 {
+				t.Error("HEIC read record lost its type, bytes or hash, or read its dimensions")
+			}
+		})
+	}
+}
+
+var (
+	claudeImageTestFormatOnce sync.Once
+	claudeImageTestDecodes    atomic.Int32
+)
+
+func TestClaudeImageOtherRegisteredFormatIsNotDecoded(t *testing.T) {
+	claudeImageTestFormatOnce.Do(func() {
+		image.RegisterFormat("claudeimagetest", "CLIMGTEST", func(io.Reader) (image.Image, error) {
+			claudeImageTestDecodes.Add(1)
+			return image.NewRGBA(image.Rect(0, 0, 10, 10)), nil
+		}, func(io.Reader) (image.Config, error) {
+			return image.Config{ColorModel: color.RGBAModel, Width: 10, Height: 10}, nil
+		})
+	})
+	claudeImageTestDecodes.Store(0)
+	raw := []byte("CLIMGTESTabcd")
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	key := fitKey("9:image/png"+encoded, claudeImageLimits)
+	t.Cleanup(func() {
+		fitted.Lock()
+		defer fitted.Unlock()
+		if el := fitted.m[key]; el != nil {
+			fitted.drop(el)
+		}
+	})
+	logs := keepLog(t)
+	mt, data, note := claudeImage("image/png", encoded)
+	record := claudeImageDetails("image/png", encoded)
+	t.Logf("type %q, image %t, note %q; record %+v; decode calls %d; %s", mt, data != "", note, record, claudeImageTestDecodes.Load(), strings.TrimSpace(logs.String()))
+	if mt != "" || data != "" || note != claudeImageOmitted {
+		t.Error("registered format was not replaced by the note")
+	}
+	if !strings.Contains(logs.String(), "unsupported image type") {
+		t.Error("missing unsupported image type reason")
+	}
+	if record.found != "image/claudeimagetest" || record.width != 10 || record.height != 10 || record.action != "note" {
+		t.Error("registered format record lost its type, dimensions or action")
+	}
+	if calls := claudeImageTestDecodes.Load(); calls != 0 {
+		t.Errorf("registered format decoded %d times, want 0", calls)
+	}
 }
 
 func TestClaudeImageConversionSlotWaitIsBounded(t *testing.T) {
@@ -218,8 +330,17 @@ func TestClaudeImageConversionPixelLimit(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/%dx%d", format, size.width, size.height), func(t *testing.T) {
 				logs := keepLog(t)
 				raw := claudeImageGray(t, format, size.width, size.height)
+				encoded := base64.StdEncoding.EncodeToString(raw)
+				key := fitKey("9:image/png"+encoded, claudeImageLimits)
+				t.Cleanup(func() {
+					fitted.Lock()
+					defer fitted.Unlock()
+					if el := fitted.m[key]; el != nil {
+						fitted.drop(el)
+					}
+				})
 				// A supported declared type must not bypass the conversion limit.
-				mt, data, note := claudeImage("image/png", base64.StdEncoding.EncodeToString(raw))
+				mt, data, note := claudeImage("image/png", encoded)
 				t.Logf("type %q, image %t, note %q; %s", mt, data != "", note, strings.TrimSpace(logs.String()))
 				if size.omitted {
 					if mt != "" || data != "" || note != claudeImageOmitted {
@@ -252,7 +373,16 @@ func TestClaudeImageConversionHugeSides(t *testing.T) {
 				t.Fatalf("fixture header: %+v, %v", cfg, err)
 			}
 			logs := keepLog(t)
-			mt, data, note := claudeImage("image/bmp", base64.StdEncoding.EncodeToString(raw))
+			encoded := base64.StdEncoding.EncodeToString(raw)
+			key := fitKey("9:image/bmp"+encoded, claudeImageLimits)
+			t.Cleanup(func() {
+				fitted.Lock()
+				defer fitted.Unlock()
+				if el := fitted.m[key]; el != nil {
+					fitted.drop(el)
+				}
+			})
+			mt, data, note := claudeImage("image/bmp", encoded)
 			t.Logf("type %q, image %t, note %q; %s", mt, data != "", note, strings.TrimSpace(logs.String()))
 			if mt != "" || data != "" || note != claudeImageOmitted {
 				t.Error("huge sides were not replaced by the note")

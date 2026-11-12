@@ -45,18 +45,20 @@ import (
 // the image: scaled to fit 2000 px a side, a JPEG written again as JPEG at
 // quality 85 and any other as PNG, then as JPEG at a lower quality if that
 // is still over the base64 limit. An image that fits goes as it came, byte
-// for byte. A BMP within the conversion limit goes as PNG, a TIFF or an
-// incomplete or unreadable image as a note. Complete supported containers
-// Go cannot decode go to Anthropic unchanged, with their real type.
+// for byte. A BMP within the conversion limit goes as PNG. A TIFF, a HEIC
+// the gateway did not convert at the door, any other format, or an
+// incomplete or unreadable image goes as a note. Complete supported
+// containers Go cannot decode go to Anthropic unchanged, with their real type.
 const (
 	claudeImageSide   = 2000
 	claudeImageBase64 = 5 << 20
 )
 
-// A BMP decoder holds at most 4 bytes a pixel; refitting adds a 4-byte
-// RGBA copy and a 16-byte row buffer per target-width * source-height
-// cell. The target width never exceeds the source's: at 3840*2160 pixels,
-// 24 bytes a pixel is about 190 MiB, within the 320 MiB decode budget.
+// A BMP decoder holds at most 4 bytes a pixel. With the refit's RGBA copy
+// and row buffer, 3840x2160 is about 190 MiB at 24 bytes a pixel (161 MiB
+// live measured). A 1x8,294,400 32-bit BMP keeps a 16-byte row buffer per
+// source row and about as much in weights: about 290 MiB including its
+// bytes. Both fit the 320 MiB budget, and only one conversion runs at a time.
 const claudeImageConvertPixels = 3840 * 2160
 
 // One BMP conversion runs at a time, including the refit. A conversion
@@ -73,6 +75,7 @@ var claudeImageLimits = imageLimits{side: claudeImageSide, patches: -1}
 
 const claudeImageOmitted = "[An image was left out: the gateway could not read it]"
 const claudeImageOmittedTIFF = "[An image was left out: TIFF images are not supported here; send it as PNG or JPEG]"
+const claudeImageOmittedHEIC = "[An image was left out: this HEIC image could not be converted; send it as PNG or JPEG]"
 
 // claudeImage is the real media type and base64 sent to Claude Code, or
 // a note in their place. A cached verdict includes the declared type:
@@ -163,6 +166,8 @@ func claudeImageReadRecord(declared, data string) claudeImageRecord {
 	record := claudeImageRecord{declared: strings.Clone(declared[:min(len(declared), 64)]), found: claudeImageType(head)}
 	if claudeImageTIFF(head) {
 		record.found = "image/tiff"
+	} else if isHEIC(head) {
+		record.found = "image/heic"
 	} else if cfg, format, err := image.DecodeConfig(io.LimitReader(rd, 1<<20)); err == nil {
 		record.width, record.height = cfg.Width, cfg.Height
 		if record.found == "" {
@@ -345,6 +350,17 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 		e.data = []byte(claudeImageOmittedTIFF)
 		return e, true
 	}
+	// heicAsJPEG converts a request's HEIC before this with its own bounds.
+	// One it let through is not decoded here, where nothing bounds that decoder.
+	if isHEIC(raw) {
+		record.found, mt = "image/heic", "image/heic"
+		if err != nil {
+			return omit("invalid base64", len(raw)), true
+		}
+		e := omit("HEIC is not converted here", len(raw))
+		e.data = []byte(claudeImageOmittedHEIC)
+		return e, true
+	}
 	cfg, format, headerErr := image.DecodeConfig(bytes.NewReader(raw))
 	if headerErr == nil {
 		record.width, record.height = cfg.Width, cfg.Height
@@ -366,6 +382,9 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) (fitEn
 			return fitEntry{mime: mt}, true
 		}
 		return omit("unreadable image header", len(raw)), true
+	}
+	if mt == "" && format != "bmp" {
+		return omit("unsupported image type", len(raw)), true
 	}
 	if format == "bmp" && cfg.Width > 0 && cfg.Height > 0 && (cfg.Width > claudeImageConvertPixels || cfg.Height > claudeImageConvertPixels/cfg.Width) {
 		return omit("image too large to convert", len(raw)), true
