@@ -89,10 +89,10 @@ func TestClaudeRunsNamesEachProcess(t *testing.T) {
 		if r.Started.Before(before) || r.Since.Before(r.Started) || time.Since(r.Since) > time.Minute {
 			t.Errorf("started %v, idle since %v (asked at %v)", r.Started, r.Since, before)
 		}
-		if left := time.Until(r.Ends); left < idleLongest-time.Minute || left > idleLongest {
-			t.Errorf("it ends in %s, not the %s an idle run is kept", left, idleLongest)
+		if left := time.Until(r.Ends); left < 30*time.Minute-time.Minute || left > 30*time.Minute {
+			t.Errorf("it ends in %s, not the %s an idle run is kept", left, 30*time.Minute)
 		}
-		if l.Live < 1 || l.IdleMost != idleMost || l.IdleFor != idleLongest {
+		if l.Live < 1 || l.IdleMost != idleMost || l.IdleFor != 30*time.Minute {
 			t.Errorf("live %d, idleMost %d, idleFor %s", l.Live, l.IdleMost, l.IdleFor)
 		}
 		s.subscription.abortAll()

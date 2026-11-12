@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -54,9 +55,10 @@ func TestClaudeClientCachePrompt(t *testing.T) {
 			}
 		})
 	}
+	imageData := base64.StdEncoding.EncodeToString(replayImage(t, "png"))
 	for _, block := range []struct{ name, raw, end string }{
 		{"text", `{"type":"text","text":"pinned","cache_control":{"type":"ephemeral","ttl":"1h"}}`, "pinned"},
-		{"image", `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="},"cache_control":{"type":"ephemeral","ttl":"1h"}}`, ""},
+		{"image", `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + imageData + `"},"cache_control":{"type":"ephemeral","ttl":"1h"}}`, ""},
 		{"tool_result", `{"type":"tool_result","tool_use_id":"call_1","content":"tool output","cache_control":{"type":"ephemeral","ttl":"1h"}}`, "tool output"},
 	} {
 		t.Run("message_"+block.name, func(t *testing.T) {

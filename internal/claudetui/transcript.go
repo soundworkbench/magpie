@@ -2,6 +2,8 @@ package claudetui
 
 import (
 	"encoding/json"
+	"log"
+	"strings"
 )
 
 // emitter is where a translator's lines go.
@@ -45,10 +47,15 @@ func (t *translator) row(b []byte) {
 		RequestID     string          `json:"requestId"`
 		Error         json.RawMessage `json:"error"`
 		IsAPIError    bool            `json:"isApiErrorMessage"`
+		APIError      string          `json:"apiError"`
+		ErrorDetails  string          `json:"errorDetails"`
+		Heals         bool            `json:"healsDistinctCarrier"`
 		APIStatus     int             `json:"apiErrorStatus"`
 		ToolUseResult json.RawMessage `json:"toolUseResult"`
 		Operation     string          `json:"operation"`
 		APIParams     struct {
+			Media         string          `json:"media"`
+			MediaReason   string          `json:"media_reason"`
 			RateLimitInfo json.RawMessage `json:"rate_limit_info"`
 		} `json:"apiErrorParams"`
 		Message json.RawMessage `json:"message"`
@@ -74,12 +81,36 @@ func (t *translator) row(b []byte) {
 		var m struct {
 			ID      string `json:"id"`
 			Model   string `json:"model"`
+			Stop    string `json:"stop_reason"`
 			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"content"`
 		}
 		_ = json.Unmarshal(r.Message, &m)
+		text := ""
+		for _, c := range m.Content {
+			if c.Type == "text" {
+				text += c.Text
+			}
+		}
+		if m.Model == "<synthetic>" && (r.APIError == "media_removed" || strings.Contains(strings.ToLower(text), MediaRemovedSentence)) {
+			// Claude Code already asked again without the image. Settling
+			// here would cut that request's stream if it began first.
+			message := MediaRemovedMessage(r.ErrorDetails)
+			log.Printf("claude-tui: media_removed: media=%q reason=%q continues=%t message_bytes=%d", r.APIParams.Media[:min(len(r.APIParams.Media), 64)], r.APIParams.MediaReason[:min(len(r.APIParams.MediaReason), 64)], r.Heals || m.Stop == "tool_use", len(message))
+			if r.Heals || m.Stop == "tool_use" {
+				t.out.emit(map[string]any{"type": "media_removed", "result": message})
+				return
+			}
+			// Tell the failure before a still-open tap can end as a cut
+			// stream. The turn_duration row settles it afterwards.
+			t.failed = true
+			t.out.turnOver()
+			t.out.emit(map[string]any{"type": "result", "subtype": "error_during_execution", "is_error": true,
+				"result": message, "api_error_status": 400, "api_error": "media_removed"})
+			return
+		}
 		if m.Model != "<synthetic>" && m.ID != "" {
 			t.tap.before(m.ID)
 		}
@@ -95,15 +126,12 @@ func (t *translator) row(b []byte) {
 		if len(r.Error) > 0 {
 			line["error"] = r.Error
 		}
+		if r.IsAPIError {
+			line["is_api_error"] = true
+		}
 		t.out.emit(line)
 		if m.Model != "<synthetic>" || !r.IsAPIError {
 			return
-		}
-		text := ""
-		for _, c := range m.Content {
-			if c.Type == "text" {
-				text += c.Text
-			}
 		}
 		t.failed = true
 		// the error's own allowance after any an earlier reply of the
@@ -153,4 +181,25 @@ func isPrompt(raw json.RawMessage) bool {
 		}
 	}
 	return len(blocks) > 0
+}
+
+// MediaRemovedSentence is the fixed part of Claude Code's older -p error,
+// whose row has none of the interactive mode's API error fields.
+const MediaRemovedSentence = "an image in the conversation could not be processed and was removed"
+
+// MediaRemovedMessage keeps Anthropic's words, without Claude Code's
+// terminal editing hint. A missing detail gets a sentence of its own.
+func MediaRemovedMessage(details string) string {
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(details), &body) == nil && body.Error.Message != "" {
+		return body.Error.Message
+	}
+	if strings.TrimSpace(details) != "" {
+		return details
+	}
+	return "An image in the conversation could not be processed and was removed."
 }

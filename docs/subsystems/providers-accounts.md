@@ -85,6 +85,27 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 
 ## Remote magpie
 
+A remote's memory is read by `RemoteLoad` in
+[`remote_load.go`](../../internal/provider/remote_load.go), without waiting
+on the request path. Its cache uses `remoteCardsID` (provider and key), is
+refreshed after 30 seconds, and is unknown after two minutes or the latest
+read failed. Unknown never means overloaded. A 404 pauses reads for ten
+minutes so older gateways remain usable. `KeepRemoteLoads`, started with
+the gateway's context, also refreshes configured remotes every 30 seconds
+without traffic. Reads use the provider's signing, headers, proxy and
+quota-read timeout. Entering and leaving overload logs once per transition.
+
+`settings.LoadGuardNow` reads this machine's `loadGuard` object on demand:
+missing or nonpositive numbers use 2048 MiB host free, 2560 MiB instance
+memory and 30 idle minutes. The guard defaults on. `off: true` stops remote
+reads and disables load routing and early process reclaim. `KeepOwn` and
+settingsapi preserve it across sync and page saves. Routing and the HTTP
+snapshot are described in [Gateway routing](gateway-routing.md#remote-magpie-apis);
+idle reclamation in the [Claude bridge](claude-subscription-bridge.md#idle-process-reclamation).
+`TestLoadGuardRemoteCache`, `TestLoadGuardRemoteTransitions`,
+`TestLoadGuardRemotePollAndStatus` and the settings `LoadGuard` tests cover
+these contracts with local servers and an injected clock.
+
 The `remote-magpie` preset is of its own kind, `KindRemote` (`remote`), not
 a relay: the app's Add sheet lists it under Another computer's magpie, after
 On this machine, and `magpie presets` and the TUI's add list name it so too

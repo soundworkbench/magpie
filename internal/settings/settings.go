@@ -414,6 +414,9 @@ type Settings struct {
 	// 100 MiB of its own, and a 512 MiB service was OOM-killed (#2956).
 	// It is this machine's, not taken from another's settings.
 	ClaudeRunsMost int `json:"claudeRunsMost,omitempty"`
+
+	// LoadGuard is this machine's own, changed through settings.json.
+	LoadGuard LoadGuardConfig `json:"loadGuard,omitzero"`
 	// RefusalRetries is how many more times a request the vendor's safety
 	// filter refused, with nothing said, is asked of another account or
 	// routing group member (#248), unset for every one left. 0 hands the
@@ -1481,6 +1484,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.RedactModel, s.RedactModelName, s.RedactModelScore = cur.RedactModel, cur.RedactModelName, cur.RedactModelScore
 	s.RedactModelOff, s.RedactModelAuto = cur.RedactModelOff, cur.RedactModelAuto
 	s.ClaudeRunsMost = cur.ClaudeRunsMost
+	s.LoadGuard = cur.LoadGuard
 	s.RequestArchiveLocal, s.RequestArchiveLocalMB = cur.RequestArchiveLocal, cur.RequestArchiveLocalMB
 	s.AgentsHere = cur.AgentsHere
 }
