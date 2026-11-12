@@ -891,6 +891,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	go provider.KeepListsFresh(ctx)
 	// and follows a Remote magpie's list as it changes there (KaCli)
 	go provider.KeepRemoteListsFollowed(ctx)
+	go provider.KeepRemoteLoads(ctx)
 	// and keeps the community's plugins up to date, noting others' updates, and the Bun they run on
 	go plugin.KeepUpdated(ctx)
 	go plugin.KeepBunUpdated(ctx)
@@ -1014,6 +1015,7 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("POST /v1/magpie/usage/requests", s.usageIngest)
 	mux.HandleFunc("GET /v1/magpie/quotas/history", s.quotasHistory)
 	mux.HandleFunc("GET "+provider.RemoteCardsPath, s.quotaCards)
+	mux.HandleFunc("GET "+provider.RemoteLoadPath, s.load)
 	mux.HandleFunc("POST "+provider.RemoteRefreshPath, s.quotaCardsRefresh)
 	mux.HandleFunc("POST "+provider.RemoteCodexResetPath, s.codexReset)
 	mux.HandleFunc("GET /v1/magpie/route", s.sessionRoute)

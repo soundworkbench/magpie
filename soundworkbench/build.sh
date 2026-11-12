@@ -11,7 +11,7 @@ cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" || exit 1
 SHA=$(git rev-parse --short "$REF^{commit}") || exit 1
 TAG=$(git describe --tags --match 'v*' --abbrev=0 "$REF") || { echo "no upstream tag below $REF: fetch the upstream tags first"; exit 1; }
 git archive "$REF" | docker run --rm -i -v magpie-gocache:/go -e GOFLAGS=-buildvcs=false -e CGO_ENABLED=0 golang:1.26-alpine \
-  sh -c 'mkdir /src && tar -x -C /src && cd /src && go test -tags nogui -count=1 -run "RemoteAllowance|WebFetch|FetchVerification|CodexFetchText|ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved" ./internal/provider/ ./internal/gateway/ ./internal/claudetui/' || exit 3
+  sh -c 'mkdir /src && tar -x -C /src && cd /src && GOMAXPROCS=2 go test -p 1 -tags nogui -count=1 -run "LoadGuard|RemoteAllowance|WebFetch|FetchVerification|CodexFetchText|ClaudeImage|ClaudeReplay|ClaudeTUIReplay|SubscriptionToolResultImages|LostMedia|ToolImages|MediaRemoved" ./internal/settings/ ./internal/settingsapi/ ./internal/provider/ ./internal/gateway/ ./internal/claudetui/' || exit 3
 git archive "$REF" | docker build -q --build-arg VERSION="${TAG#v}-xm" -t "$IMAGE:$TAG-xm" -t "$IMAGE:$TAG-xm-$SHA" - || exit 1
 docker run --rm --entrypoint /magpie "$IMAGE:$TAG-xm" --version | head -1
 echo "$IMAGE:$TAG-xm $IMAGE:$TAG-xm-$SHA"

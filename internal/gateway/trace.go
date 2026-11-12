@@ -436,6 +436,8 @@ type Weighed struct {
 	// the user's settings.BusyLoad, so it was tried after every ready
 	// candidate that isn't (restLast)
 	Busy float64 `json:"busy,omitempty"`
+	// Loaded is why a remote is deferred for new conversations only.
+	Loaded string `json:"loaded,omitempty"`
 	// CreditsFirst: such an account (Credits) the user set to spend its
 	// credits before another account: all but used up, it keeps its
 	// place, new conversations and kept ones included

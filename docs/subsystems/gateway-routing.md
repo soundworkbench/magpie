@@ -626,6 +626,52 @@ sees nor uses). Before it, a key could be held to some groups (a key's
 
 ## Remote magpie APIs
 
+`GET /v1/magpie/load` (`provider.RemoteLoadPath`,
+[`load_guard.go`](../../internal/gateway/load_guard.go)) uses the gateway's
+normal authentication and allows read-only keys. It returns the Unix
+snapshot time, host available/total memory, instance working set and limit
+in MiB, and live/idle Claude subscription run counts. Linux reads host
+`MemAvailable`/`MemTotal` and its cgroup v2 `memory.current` minus
+`inactive_file`, with `memory.max` as the limit (`max` means 0). Without a
+readable working set it sums this process and its descendants' RSS.
+Processes that disappear or deny access while `/proc` is scanned are skipped;
+a missing root still means unknown. Missing `VmRSS` (as for a zombie) counts
+as zero; malformed RSS in a readable descendant remains unknown.
+Unavailable memory is -1, including on non-Linux platforms; the snapshot
+still succeeds. The `remotes` array contains each configured remote's last
+reading, local reception time, whether it is still known, overload reason
+and active 404 backoff. It never fetches recursively. With `loadGuard.off`,
+this endpoint returns 404, as before it existed.
+
+The [load guard settings and remote cache](providers-accounts.md#remote-magpie)
+feed `restLast`: ready, busy, loaded, resting, then credits-last, each stable
+in its existing order. `Weighed.Loaded` records the reason in the trace.
+`readyForNew`, `leastHeld`, `withLead`, turn rotation and burst spreading
+skip loaded candidates; rotation still proceeds when all eligible candidates
+are loaded. If all are loaded their order stays and the request is tried.
+Unlike busy, load never sends an existing conversation away at a new turn.
+Session, turn and cache affinity keep their answerer, including a nearly
+spent answerer moved back solely by load. For a loaded answerer, the spent
+rule still moves it if it already followed another ready or loaded candidate
+before load deferral; resting, credits-last and busy candidates do not count
+as that earlier alternative. An answerer that is not overloaded follows the
+original spent rule at its current position, including when busy within a
+turn or when the guard is disabled. A new seat (`first`, `gone`,
+`no-cache` or `cold`) is remembered as `loadChosen` in `affinity.json` only
+when it passed an overloaded candidate that otherwise belonged in the ready
+bucket: not resting, busy, credits-last, aside or reserved. If a resting,
+busy or credits-last candidate preceded the chosen seat in the original
+order, the seat is already a backup and receives no load mark. An existing
+conversation does not acquire this mark just because a preceding candidate
+becomes overloaded. A marked seat stays when load clears, including across
+restarts; an earlier candidate resting or going onto credits-last clears that
+exemption, but temporary plugin busy load does not. Return to a recovered main
+or from a stand-in still applies even if the backup is overloaded. Existing
+rest, quota and explicit affinity rules continue to apply. Disabling the guard
+ignores this memory of load deferral and restores the prior routing decisions.
+`TestLoadGuard*` covers memory fixtures, authentication, order, affinity,
+recovery and disabled behavior.
+
 `GET /v1/magpie/trace` answers the routing this gateway has decided, for a
 magpie on the same computer that does not serve it, whose console plays it as
 its own Routing page (#2606). A trace names accounts and their emails, what
