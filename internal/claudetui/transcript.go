@@ -98,7 +98,7 @@ func (t *translator) row(b []byte) {
 			// Claude Code already asked again without the image. Settling
 			// here would cut that request's stream if it began first.
 			message := MediaRemovedMessage(r.ErrorDetails)
-			log.Printf("claude-tui: media_removed: media=%q reason=%q continues=%t message_bytes=%d", r.APIParams.Media, r.APIParams.MediaReason, r.Heals || m.Stop == "tool_use", len(message))
+			log.Printf("claude-tui: media_removed: media=%q reason=%q continues=%t message_bytes=%d", r.APIParams.Media[:min(len(r.APIParams.Media), 64)], r.APIParams.MediaReason[:min(len(r.APIParams.MediaReason), 64)], r.Heals || m.Stop == "tool_use", len(message))
 			if r.Heals || m.Stop == "tool_use" {
 				t.out.emit(map[string]any{"type": "media_removed", "result": message})
 				return

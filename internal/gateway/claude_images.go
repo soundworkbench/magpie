@@ -53,6 +53,15 @@ const (
 	claudeImageBase64 = 5 << 20
 )
 
+// At 3840*2160 pixels, the worst TIFF holds 8 bytes per pixel of image
+// plus up to 2*8 bytes per pixel of strip buffer: about 200 MiB, within
+// the 320 MiB decode budget.
+const claudeImageConvertPixels = 3840 * 2160
+
+// These costly decoders are fed by clients; only one conversion may run
+// at a time, including the refit that still holds the decoded image.
+var claudeImageConvertMu sync.Mutex
+
 // claudeImageLimits keys the images claudeImage made in fitted, apart
 // from Codex's.
 var claudeImageLimits = imageLimits{side: claudeImageSide, patches: -1}
@@ -133,7 +142,7 @@ func claudeImageReadRecord(declared, data string) claudeImageRecord {
 	rd := bufio.NewReader(io.TeeReader(base64.NewDecoder(base64.StdEncoding, strings.NewReader(data)), io.MultiWriter(hash, count)))
 	head, _ := rd.Peek(12)
 	record := claudeImageRecord{declared: strings.Clone(declared[:min(len(declared), 64)]), found: claudeImageType(head)}
-	if cfg, format, err := image.DecodeConfig(rd); err == nil {
+	if cfg, format, err := image.DecodeConfig(io.LimitReader(rd, 1<<20)); err == nil {
 		record.width, record.height = cfg.Width, cfg.Height
 		if record.found == "" {
 			record.found = "image/" + format
@@ -322,12 +331,19 @@ func claudeImageChecked(declared, data string, record *claudeImageRecord) fitEnt
 		}
 		return omit("unreadable image header", len(raw))
 	}
+	if mt == "" && cfg.Width > 0 && cfg.Height > 0 && (cfg.Width > claudeImageConvertPixels || cfg.Height > claudeImageConvertPixels/cfg.Width) {
+		return omit("image too large to convert", len(raw))
+	}
 	holds, ok := imageHolds(cfg, format)
 	if !ok || holds > codexImageMaxBytes-len(raw) {
 		if claudeImageComplete(mt, raw) {
 			return fitEntry{mime: mt}
 		}
 		return omit("image exceeds the decode limit", len(raw))
+	}
+	if mt == "" {
+		claudeImageConvertMu.Lock()
+		defer claudeImageConvertMu.Unlock()
 	}
 	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
