@@ -1,8 +1,8 @@
 // Package budget holds each gateway key to its own limit (#585): what a
 // key has used in its window is summed from usage.jsonl, the records the
 // Usage page shows, so it survives a restart; a request is let in only
-// while the key has something left after what its requests in flight are
-// expected to use, and those are settled with what the call recorded.
+// while the key has something left of its settled usage. In-flight
+// reservations count against caps only when HoldReservations is enabled.
 //
 // The rules:
 //   - A call counts in the window it started in (its record's time).
@@ -19,8 +19,9 @@
 //     reported; one cut off before that counts what was recorded.
 //   - While a request is in flight it holds a reservation: its body's
 //     size in tokens (4 bytes a token) plus the key's mean output per
-//     call this window. A request is let in while used + reserved is
-//     under the cap, so parallel requests overshoot by about one call.
+//     call this window. The fork defaults to checking settled usage only;
+//     HoldReservations enables upstream behaviour, checking used + reserved.
+//     Reservations are recorded and released in either mode.
 //   - A key can have several limits, each in its own window (#2227: 5
 //     hours and a week, as a subscription's): a request is let in only
 //     while every one has something left, and its reservation is held
@@ -33,7 +34,9 @@
 //     goes on to the models outside it, as the gateway leaves a spent
 //     limit's models out of every route's candidates (Spent). A group's
 //     request holds no reservation in a model's limit, so parallel
-//     requests through groups can go over it by about one call each.
+//     requests through groups can go over it by about one call each when
+//     HoldReservations is enabled; with it off (the fork's default),
+//     all requests are checked against settled usage only.
 //   - Only requests that came with a gateway key are limited: from
 //     another computer one is required; on this one a request without one
 //     (or with a token that is no key) isn't limited.
@@ -53,6 +56,10 @@ import (
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
+
+// HoldReservations makes in-flight reservations count against a cap (upstream behaviour).
+// The fork leaves it off: a key is refused only by what it has actually used.
+var HoldReservations = false
 
 // sums is what a key's calls came to in a window.
 type sums struct {
@@ -372,7 +379,11 @@ type Refusal struct {
 // cap, and when it resets.
 func (r *Refusal) Error() string {
 	what := ""
-	if r.TokenLimit > 0 && r.Tokens+r.Reserved >= r.TokenLimit {
+	reserved := int64(0)
+	if HoldReservations {
+		reserved = r.Reserved
+	}
+	if r.TokenLimit > 0 && r.Tokens+reserved >= r.TokenLimit {
 		counted := "input, output and cache-write tokens"
 		if r.CacheReads {
 			counted = "input, output and cache tokens"
@@ -381,7 +392,7 @@ func (r *Refusal) Error() string {
 	} else {
 		what = fmt.Sprintf("$%.2f of its $%.2f estimated cost", r.Cost, r.CostLimit)
 	}
-	if !r.Spent {
+	if HoldReservations && !r.Spent {
 		what += fmt.Sprintf(", with %d requests in flight holding the rest", r.InFlight)
 	}
 	on := ""
@@ -457,7 +468,7 @@ func reserve(who access.Identity, body int64, model string, now time.Time) (rele
 		s, h := ss[i], heldAt(i)
 		var ht int64
 		var hc float64
-		if h != nil {
+		if HoldReservations && h != nil {
 			ht, hc = h.tokens, h.cost
 		}
 		if (l.Tokens > 0 && s.tokens(l)+ht >= l.Tokens) || (l.Cost > 0 && s.cost+hc >= l.Cost) {
@@ -589,7 +600,7 @@ func spentOf(who access.Identity, now time.Time) []access.SpentScope {
 		s, h := ss[i], state.held[window{slot(who.KeyID), starts[i].Unix(), l.Scope()}]
 		var ht int64
 		var hc float64
-		if h != nil {
+		if HoldReservations && h != nil {
 			ht, hc = h.tokens, h.cost
 		}
 		if (l.Tokens > 0 && s.tokens(l)+ht >= l.Tokens) || (l.Cost > 0 && s.cost+hc >= l.Cost) {
