@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -195,7 +194,11 @@ func allowPrivate(t *testing.T, entries ...string) {
 	if err := settings.Save(st); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { settings.Save(was) })
+	t.Cleanup(func() {
+		if err := settings.Save(was); err != nil {
+			t.Errorf("restore private fetch settings: %v", err)
+		}
+	})
 }
 
 // fetchPrivate's entries are a name, name:port, an IP or a range; a
@@ -222,9 +225,7 @@ func TestFetchPrivateEntries(t *testing.T) {
 			t.Errorf("%s: %v", ip, !ok)
 		}
 	}
-	if err := os.WriteFile(settings.Path(), []byte("{not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeSettingsFile(t, []byte("{not json"))
 	a = allowFor(nil)
 	if a.host("nas.lan", "443") || a.addr(netip.MustParseAddr("10.1.2.3")) {
 		t.Fatal("an unreadable settings.json let a private host in")
