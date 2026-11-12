@@ -164,6 +164,9 @@ func TestKeyLimitRefusesBeforeUpstream(t *testing.T) {
 // those in flight hold a reservation, so the key goes over by about one
 // call, not by N.
 func TestKeyLimitHoldsParallelRequests(t *testing.T) {
+	old := budget.HoldReservations
+	budget.HoldReservations = true
+	t.Cleanup(func() { budget.HoldReservations = old })
 	fresh(t)
 	budget.Forget()
 	now := pinLimitClock(t)
@@ -251,6 +254,9 @@ func TestKeyLimitWindowResets(t *testing.T) {
 // An unfinished call belongs to the window it started in, including its
 // reservation. A late check or release of it cannot spend the new window.
 func TestKeyLimitReservationsStayInTheirWindow(t *testing.T) {
+	old := budget.HoldReservations
+	budget.HoldReservations = true
+	t.Cleanup(func() { budget.HoldReservations = old })
 	for _, period := range access.Periods {
 		for _, cap := range []struct {
 			name   string

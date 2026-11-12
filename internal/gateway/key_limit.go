@@ -30,7 +30,9 @@ const remoteKeyLimitHeader = "X-Magpie-Limit-Reset"
 // keyLimited holds a gateway key's requests to its limit (#585, see
 // package budget for the rules): one that would go over is refused with a
 // 429 before any provider is asked, saying the key, the limit and when it
-// resets; one let in holds a reservation until it ends. A key with a limit
+// resets; one let in holds a reservation until it ends. With
+// budget.HoldReservations off (the fork's default), only settled usage
+// determines refusal. A key with a limit
 // while plugins/budget is off is refused with a 503, and nothing is sent. Reads, the
 // bridge's tool callbacks and counting tokens cost nothing and pass.
 //
