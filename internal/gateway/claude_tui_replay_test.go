@@ -22,7 +22,7 @@ import (
 // pasted one by one until the paste timed out (#4780).
 func TestClaudeTUIReplayGoesInATranscript(t *testing.T) {
 	h := tuiScriptHarness(t, `[ -f "$file" ] && cp "$file" "$file.seen"`)
-	img := base64.StdEncoding.EncodeToString(pngBytes)
+	img := base64.StdEncoding.EncodeToString(replayImage(t, "png"))
 	body := `{"model":"claude-sonnet-5","max_tokens":100,"system":"rules","tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[` +
 		`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + img + `"}},{"type":"text","text":"what is it"}]},` +
 		`{"role":"assistant","content":[{"type":"thinking","thinking":"hm","signature":"x"},{"type":"text","text":"a red square"}]},` +

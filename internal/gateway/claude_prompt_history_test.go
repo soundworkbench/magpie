@@ -15,7 +15,7 @@ import (
 // was sent in them, apart from the turn to answer now (#1365). Told as one
 // stretch of Human:/Assistant: text, every image in it read as just sent.
 func TestClaudePromptMarksEarlierTurns(t *testing.T) {
-	img := Part{Kind: Image, MediaType: "image/png", Data: "iVBORw0KGgo="}
+	img := Part{Kind: Image, MediaType: "image/png", Data: base64.StdEncoding.EncodeToString(replayImage(t, "png"))}
 	req := &Request{Messages: []Message{
 		{Role: "user", Parts: []Part{{Kind: Text, Text: "look at this"}, img}},
 		{Role: "assistant", Parts: []Part{{Kind: Text, Text: "a cat"}}},
@@ -132,7 +132,7 @@ func TestClaudePromptSaysWhoseImageNotesAre(t *testing.T) {
 // another computer. The turn says the images are in it, in a run told the
 // whole conversation and in a turn told to a saved session.
 func TestClaudePromptSaysToolResultImagesAreAttached(t *testing.T) {
-	img := Part{MediaType: "image/png", Data: "iVBORw0KGgo="}
+	img := Part{MediaType: "image/png", Data: base64.StdEncoding.EncodeToString(replayImage(t, "png"))}
 	calls := make([]Part, 7)
 	results := make([]Part, 7)
 	for i := range calls {

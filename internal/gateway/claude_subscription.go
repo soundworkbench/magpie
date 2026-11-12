@@ -198,6 +198,12 @@ type subscriptionRun struct {
 	// has it under (bridgeToolName), for those it differs: under r.mu
 	names map[string]string
 
+	// Images handed over in replay/prompt blocks and MCP results during
+	// this run, under mu. Older turns remain in Claude Code's history.
+	// Current-turn files pasted by claudetui are not covered here.
+	images        []claudeImageRecord
+	imagesDropped int
+
 	mu sync.Mutex
 	// sending is held across a send to the segment and taken before it is
 	// closed, so a send blocked on a full segment no one reads yet holds
@@ -1290,6 +1296,20 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	run.lean = req.leanPrompt
 	run.appended = req.appendPrompt
 	run.tui = tui
+	if req.replayed {
+		run.noteMessageImages(req.Messages[:historyEnd(req.Messages)-1])
+	} else if tui && from == nil {
+		// Told history also passes imageBlocks; the current turn's files
+		// are fitted again by Claude Code after claudetui pastes them.
+		run.noteMessageImages(req.Messages[:historyEnd(req.Messages)])
+	}
+	if !tui {
+		messages := req.Messages
+		if from != nil {
+			messages = messages[len(messages)-len(from.since):]
+		}
+		run.noteMessageImages(messages)
+	}
 	run.cachePrefix = prefix
 	if tuiBody != "" {
 		run.safeguards = bytes.Clone(req.Safeguards)
@@ -1976,6 +1996,9 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 	// the message's id is the turn's, to rewind to if the client gives up
 	// on it
 	turn := newUUID()
+	if !run.tui {
+		run.noteMessageImages(since)
+	}
 	line, _ := json.Marshal(map[string]any{"type": "user", "uuid": turn, "message": map[string]any{"role": "user", "content": renderClaudeTurn(since, req.Tools)}})
 	run.mu.Lock()
 	if run.closed {
@@ -3811,6 +3834,19 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	// closed empty when the run ended, and a reply asked for whole went
 	// as a 200 with no content and no usage, which the client took for
 	// the answer (steven_4422, 18 images to claude-sonnet-5-5).
+	mediaRemoved := ""          // Anthropic refused an image; Claude Code may ask again
+	var mediaSegment chan Event // under pmu, like mediaRemoved
+	// A notice belongs to the request waiting for the resent reply, never
+	// to a later tool-result request attached to this same turn.
+	mediaPending := func() bool { // pmu held
+		r.mu.Lock()
+		same := mediaSegment != nil && mediaSegment == r.segment
+		r.mu.Unlock()
+		if !same {
+			mediaRemoved, mediaSegment = "", nil
+		}
+		return mediaRemoved != ""
+	}
 	begun := false       // a message began since the turn's last result
 	aside := ""          // what Claude Code said in its own words this turn
 	retell := false      // the run is told to make its calls once this turn's result is in
@@ -3848,6 +3884,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			default:
 				text(held)
 			}
+			mediaRemoved, mediaSegment = "", nil
 			r.emit(Event{Kind: KStop, Stop: stopFromAnthropic(why)})
 		}
 	}
@@ -3860,6 +3897,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		}
 		unstreamed = ""
 		end(unstreamedStop)
+		if mediaPending() && unstreamedStop == "" {
+			return // the turn's result must say whether the retry answered
+		}
 		if !inside {
 			r.endSegment()
 		}
@@ -4020,18 +4060,34 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		}
 		return nil
 	}
+	mediaFailure := func() {
+		if quiet != nil {
+			quiet.Stop()
+		}
+		unstreamed = ""
+		cut = false
+		r.emit(Event{Kind: KError, Text: mediaRemoved, Status: http.StatusBadRequest,
+			Code: "media_removed", RequestID: reqID,
+			Said: json.RawMessage(`{"error":{"type":"invalid_request_error"}}`)})
+		r.endSegment()
+	}
 	// failed ends the reply with an error where it was cut short with
 	// nothing to go on in
 	failed := func(why string) {
+		if mediaPending() {
+			mediaFailure()
+			return
+		}
 		cut = false
 		r.emit(Event{Kind: KError, Text: "Claude Code's stream from Anthropic was cut short " + why, Status: http.StatusBadGateway, RequestID: reqID})
 		r.endSegment()
 	}
 	line := func(b []byte) {
 		var envelope struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
-			IsError bool   `json:"is_error"`
+			Type       string `json:"type"`
+			Subtype    string `json:"subtype"`
+			IsError    bool   `json:"is_error"`
+			IsAPIError bool   `json:"is_api_error"`
 			// Claude Code's session, on its init message
 			SessionID string `json:"session_id"`
 			Result    string `json:"result"`
@@ -4043,6 +4099,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			// and on a failure the HTTP status Claude Code got and its
 			// name for the kind of error (rate_limit, server_error…)
 			RequestID      string          `json:"request_id"`
+			APIError       string          `json:"api_error"`
 			APIErrorStatus int             `json:"api_error_status"`
 			ErrorKind      json.RawMessage `json:"error"`
 			// what Claude Code's WebSearch found, on the message that
@@ -4092,6 +4149,34 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		if json.Unmarshal(b, &envelope) != nil {
 			return
 		}
+		if envelope.Type == "result" && (envelope.APIError == "media_removed" ||
+			envelope.IsError && strings.Contains(strings.ToLower(envelope.Result), claudetui.MediaRemovedSentence)) {
+			if mediaRemoved == "" {
+				r.logImages()
+			}
+			if envelope.APIError != "media_removed" && mediaRemoved == "" {
+				log.Printf("claude: media_removed: media=%q reason=%q continues=false message_bytes=%d", "image", "unprocessable", len(envelope.Result))
+			}
+			mediaRemoved = envelope.Result
+			if envelope.APIError != "media_removed" || mediaRemoved == "" {
+				mediaRemoved = claudetui.MediaRemovedMessage("")
+			}
+			mediaFailure()
+			mediaRemoved, begun, aside = "", false, ""
+			return
+		}
+		if envelope.Type == "media_removed" {
+			r.mu.Lock()
+			mediaSegment = r.segment
+			r.mu.Unlock()
+			r.logImages()
+			mediaRemoved = envelope.Result
+			if mediaRemoved == "" {
+				mediaRemoved = claudetui.MediaRemovedMessage("")
+			}
+			mediaPending() // a notice with no open segment is not kept
+			return
+		}
 		var whole struct {
 			ID               string          `json:"id"`
 			Model            string          `json:"model"`
@@ -4111,6 +4196,22 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		}
 		if envelope.Type == "assistant" {
 			_ = json.Unmarshal(envelope.Message, &whole)
+			if whole.Model == "<synthetic>" {
+				for _, c := range whole.Content {
+					if c.Type == "text" && strings.Contains(strings.ToLower(c.Text), claudetui.MediaRemovedSentence) {
+						if mediaRemoved == "" {
+							r.logImages()
+							log.Printf("claude: media_removed: media=%q reason=%q continues=false message_bytes=%d", "image", "unprocessable", len(c.Text))
+						}
+						mediaRemoved = claudetui.MediaRemovedMessage("")
+						mediaFailure()
+						return
+					}
+				}
+				if envelope.IsAPIError || len(envelope.ErrorKind) > 0 {
+					mediaRemoved = "" // a later ordinary API failure keeps its own handling
+				}
+			}
 			var ids []string
 			for _, c := range whole.Content {
 				if c.Type == "tool_use" && strings.HasPrefix(c.Name, "mcp__magpie__") && c.ID != "" {
@@ -4189,6 +4290,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			}
 		}
 		if envelope.Type == "result" {
+			defer func() { mediaRemoved = "" }()
 			retell, answerAsked = false, false
 			silent, said := !begun, aside
 			begun, aside = false, ""
@@ -4224,6 +4326,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				}
 				r.emit(Event{Kind: KError, Text: text, Status: envelope.APIErrorStatus, Code: errKind, RequestID: reqID})
 				r.endSegment()
+			case mediaPending() && r.waitingOnReply() &&
+				(silent || cut || !waiting && r.replyUnended() || waiting && (len(envelope.StructuredOutput) == 0 || string(envelope.StructuredOutput) == "null")):
+				mediaFailure()
 			case cut:
 				failed("and Claude Code ended the turn without asking again")
 			case waiting && len(envelope.StructuredOutput) > 0 && string(envelope.StructuredOutput) != "null":
@@ -4441,7 +4546,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	defer pmu.Unlock()
 	over = true
 	settle()
-	if err := s.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
+	if mediaPending() && r.waitingOnReply() {
+		mediaFailure()
+	} else if err := s.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
 		r.emit(Event{Kind: KError, Text: err.Error()})
 	} else if cut {
 		failed("and Claude Code stopped")
@@ -5230,8 +5337,11 @@ func imageBlocks(blocks []map[string]any, text *strings.Builder, p Part) []map[s
 		text.Reset()
 	}
 	switch {
-	case p.Data != "":
-		mediaType, data := claudeImage(p.MediaType, p.Data)
+	case p.Data != "" || p.URL == "":
+		mediaType, data, note := claudeImage(p.MediaType, p.Data)
+		if note != "" {
+			return append(blocks, map[string]any{"type": "text", "text": note})
+		}
 		blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": mediaType, "data": data}})
 	case p.URL != "":
 		blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": p.URL}})
@@ -5780,6 +5890,7 @@ func (r *subscriptionRun) continueWith(results []Part, said string, tools []brid
 	delivered := 0
 	for _, p := range results {
 		result := mcpResult(p)
+		r.noteImages(p.Images)
 		result.Tools = tools
 		r.mu.Lock()
 		waiter := r.pending[p.CallID]
@@ -5848,6 +5959,57 @@ func (r *subscriptionRun) queue(said string) error {
 	return nil
 }
 
+// noteMessageImages follows the same image parts as renderCachedParts.
+func (r *subscriptionRun) noteMessageImages(messages []Message) {
+	for _, m := range messages {
+		for _, p := range m.Parts {
+			switch p.Kind {
+			case Image:
+				r.noteImages([]Part{p})
+			case ToolResult:
+				r.noteImages(p.Images)
+			}
+		}
+	}
+}
+
+func (r *subscriptionRun) noteImages(images []Part) {
+	for _, im := range images {
+		if im.Data == "" && im.URL != "" {
+			continue // no bytes were handed over
+		}
+		record := claudeImageDetails(im.MediaType, im.Data)
+		r.mu.Lock()
+		if len(r.images) == 64 {
+			copy(r.images, r.images[1:])
+			r.images = r.images[:63]
+			r.imagesDropped++
+		}
+		r.images = append(r.images, record)
+		r.mu.Unlock()
+	}
+}
+
+func (r *subscriptionRun) logImages() {
+	r.mu.Lock()
+	images := slices.Clone(r.images)
+	dropped := r.imagesDropped
+	r.mu.Unlock()
+	var line strings.Builder
+	fmt.Fprintf(&line, "claude: media_removed: %d images handed over", len(images)+dropped)
+	if dropped > 0 {
+		fmt.Fprintf(&line, " (%d not listed)", dropped)
+	}
+	for i, im := range images {
+		sep := ";"
+		if i == 0 {
+			sep = ":"
+		}
+		fmt.Fprintf(&line, "%s [%d] declared %q found %q %d bytes %dx%d sha256 %s %s", sep, i+1, im.declared, im.found, im.bytes, im.width, im.height, im.hash, im.action)
+	}
+	log.Print(line.String())
+}
+
 // mcpResult is a tool result as an MCP tools/call answers: its text, then
 // the images the tool returned as MCP image content, which Claude Code hands
 // its model as image blocks. MCP carries an image's bytes only, so one known
@@ -5856,8 +6018,12 @@ func mcpResult(p Part) mcpToolResult {
 	content := []map[string]any{{"type": "text", "text": p.Text}}
 	for _, im := range p.Images {
 		switch {
-		case im.Data != "":
-			mimeType, data := claudeImage(imageMediaType(im), im.Data)
+		case im.Data != "" || im.URL == "":
+			mimeType, data, note := claudeImage(im.MediaType, im.Data)
+			if note != "" {
+				content = append(content, map[string]any{"type": "text", "text": note})
+				continue
+			}
 			content = append(content, map[string]any{"type": "image", "data": data, "mimeType": mimeType})
 		case im.URL != "":
 			content = append(content, map[string]any{"type": "text", "text": "[image: " + im.URL + "]"})
@@ -5866,15 +6032,11 @@ func mcpResult(p Part) mcpToolResult {
 	return mcpToolResult{Content: content, IsError: p.IsError}
 }
 
-// imageMediaType is an inline image's type, read from its bytes when the
-// client did not say.
+// imageMediaType is an inline image's type, read from its bytes.
 func imageMediaType(p Part) string {
-	if p.MediaType != "" {
-		return p.MediaType
-	}
 	head := p.Data[:min(len(p.Data), 64)]
 	b, _ := base64.StdEncoding.DecodeString(head[:len(head)/4*4])
-	return http.DetectContentType(b)
+	return claudeImageType(b)
 }
 
 func callIDs(parts []Part) string {
@@ -7257,6 +7419,9 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 				usage.add(Usage{ErrType: head[n-1].Code, RequestID: head[n-1].RequestID})
 				msg = thirdPartyRefused(name, req, code, msg)
 			}
+			if n > 0 && head[n-1].Code == "media_removed" {
+				return writeError(w, from, code, msg), msg
+			}
 			return writeError(w, from, code, name+": "+msg), msg
 		}
 		if begin != nil {
@@ -7274,6 +7439,9 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 				return
 			case KError:
 				failed = ev.Text
+				if ev.Code == "media_removed" {
+					noteSaidStatus(w, ev.Status)
+				}
 			case KStart, KUsage:
 				usage.add(ev.Usage)
 				usage.add(Usage{Served: ev.Model, RequestID: ev.RequestID})
@@ -7343,6 +7511,9 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 		}
 		usage.add(Usage{ErrType: col.errCode})
 		msg = thirdPartyRefused(name, req, code, msg)
+		if col.errCode == "media_removed" {
+			return writeError(w, from, code, msg), msg
+		}
 		return writeError(w, from, code, name+": "+msg), msg
 	}
 	ended(said, stop, col.err == "" && r.Context().Err() == nil)

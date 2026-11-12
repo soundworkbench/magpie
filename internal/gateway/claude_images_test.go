@@ -120,14 +120,14 @@ func TestClaudeReplayFitsATallImage(t *testing.T) {
 }
 
 // An image that fits goes as it came, byte for byte; one that can't be
-// read goes as it came too.
+// read is replaced by a note.
 func TestClaudeImageThatFitsGoesAsItCame(t *testing.T) {
 	small := tallShot(t, 400, 2000)
-	if mt, d := claudeImage("image/jpeg", small); mt != "image/jpeg" || d != small {
+	if mt, d, note := claudeImage("image/jpeg", small); mt != "image/jpeg" || d != small || note != "" {
 		t.Fatal("an image within 2000 px was written again")
 	}
-	if mt, d := claudeImage("image/png", "bm90IGFuIGltYWdl"); mt != "image/png" || d != "bm90IGFuIGltYWdl" {
-		t.Fatal("bytes that aren't an image were changed")
+	if mt, d, note := claudeImage("image/png", "bm90IGFuIGltYWdl"); mt != "" || d != "" || note != claudeImageOmitted {
+		t.Fatal("bytes that are not an image were not replaced by a note")
 	}
 }
 
