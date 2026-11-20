@@ -295,6 +295,8 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.RequestArchiveMaxMB = cur.RequestArchiveMaxMB   // in settings.json only
 	in.LoadGuard = cur.LoadGuard                       // this machine's settings.json
 	in.ClaudeRunsMost = cur.ClaudeRunsMost             // magpie claude-code runs, or settings.json (#2956)
+	in.WarmWait = cur.WarmWait                         // settings.json only
+	in.ClaudeCacheTTL = cur.ClaudeCacheTTL             // settings.json only
 	in.GatewayConversations = cur.GatewayConversations // Sessions' explicit recording consent
 	in.RedactRules = cur.RedactRules                   // the masking rules, set on their own
 	in.RedactModel = cur.RedactModel                   // set on its own (privacy-model)

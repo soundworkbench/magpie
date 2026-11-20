@@ -43,6 +43,7 @@ func magpieChose(ctx context.Context) context.Context {
 // for the key too, as their spend counts in it.
 func keyHolds(r *http.Request) (access.Identity, bool) {
 	who := access.Caller(r.Context())
+	who = relayModelsFor(r, who)
 	if chose, _ := r.Context().Value(magpieChoseKey{}).(bool); chose {
 		if len(who.Spent) == 0 {
 			return who, false
@@ -59,6 +60,7 @@ func keyHolds(r *http.Request) (access.Identity, bool) {
 // does, and a request for one is told why it is refused.
 func keyListHolds(r *http.Request) (access.Identity, bool) {
 	who := access.Caller(r.Context())
+	who = relayModelsFor(r, who)
 	who.Spent = nil
 	if !who.Restricted() {
 		return who, false
@@ -67,6 +69,17 @@ func keyListHolds(r *http.Request) (access.Identity, bool) {
 		return who, false
 	}
 	return who, true
+}
+
+// relayModelsFor adds the key's relay-only patterns while evaluating a
+// request that carried the configured relay token. Ordinary requests keep
+// the key's original model set.
+func relayModelsFor(r *http.Request, who access.Identity) access.Identity {
+	if !relayRequest(r) || who.AccountModels || len(who.Models) == 0 || len(who.RelayModels) == 0 {
+		return who
+	}
+	who.Models = append(slices.Clone(who.Models), who.RelayModels...)
+	return who
 }
 
 // spentFor is the key's spent limit that counts provider p's model, by
@@ -132,11 +145,11 @@ func spentOfMembers(who access.Identity, ms []provider.Member) (access.SpentScop
 // a route found itself (an embedding, image or video group's, which
 // provider.FindGroup's chat members leave out): its 429 when a spent limit
 // counts one of them.
-func keyGroupRefusal(w http.ResponseWriter, who access.Identity, ref string, ms []provider.Member) (int, string) {
+func keyGroupRefusal(w http.ResponseWriter, who access.Identity, ref string, ms []provider.Member, relay bool) (int, string) {
 	if s, ok := spentOfMembers(who, ms); ok {
 		return spentRefusal(w, s)
 	}
-	return keyModelRefusal(w, who, ref)
+	return keyModelRefusal(w, who, ref, relay)
 }
 
 // keyModelRefusal is the status and message a request for ref its key may not
@@ -145,14 +158,14 @@ func keyGroupRefusal(w http.ResponseWriter, who access.Identity, ref string, ms 
 // keyModelError's 403. It names no reset in remoteKeyLimitHeader: a
 // magpie using this one as a remote rests only the model on it, as the
 // key's other models are still served.
-func keyModelRefusal(w http.ResponseWriter, who access.Identity, ref string) (int, string) {
+func keyModelRefusal(w http.ResponseWriter, who access.Identity, ref string, relay bool) (int, string) {
 	if g, _, ok := provider.FindGroup(ref); ok && groupBarred(who, g) {
 		return http.StatusForbidden, groupKeysError(who, g)
 	}
 	if s, ok := spentRef(who, ref); ok {
 		return spentRefusal(w, s)
 	}
-	return http.StatusForbidden, keyModelError(who, ref)
+	return http.StatusForbidden, keyModelError(who, ref, relay)
 }
 
 // groupKeysError is what a key is told of a routing group bound to other
@@ -758,7 +771,10 @@ func (s *Server) onKeys(r *http.Request, p provider.Provider, model, asked strin
 }
 
 // keyModelError is what a request for a model its key may not use is told.
-func keyModelError(who access.Identity, model string) string {
+func keyModelError(who access.Identity, model string, relay bool) string {
+	if !relay && len(who.RelayModels) > 0 && access.ModelAllowed(who.RelayModels, model) {
+		return fmt.Sprintf("这把钥匙只能在工作伙伴里使用 %s；普通入口请使用其它模型。", model)
+	}
 	return fmt.Sprintf("The gateway key %q may not use %s; it may use %s. Change the key's models in magpie's Gateway page, or use a model it has.",
 		who.KeyName, model, strings.Join(who.Models, ", "))
 }
@@ -836,7 +852,7 @@ func countHeld(w http.ResponseWriter, r *http.Request, proto provider.Protocol, 
 	}
 	g, ms, isGroup := provider.FindGroup(id)
 	if isGroup && !groupGiven(r, keyWho, held, g, ms) || held && !isGroup && !modelAllowed(keyWho, p, model) {
-		st, msg := keyModelRefusal(w, keyWho, id)
+		st, msg := keyModelRefusal(w, keyWho, id, relayRequest(r))
 		writeError(w, proto, st, msg)
 		return true
 	}

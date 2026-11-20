@@ -35,6 +35,10 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 		access.MigrateLegacyLANKeyBestEffort()
 		return gatewayKeyModels(out, args[1:])
 	}
+	if action == "relay-models" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyRelayModels(out, args[1:])
+	}
 	if action == "accounts" {
 		access.MigrateLegacyLANKeyBestEffort()
 		return gatewayKeyAccounts(out, args[1:])
@@ -100,7 +104,7 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 		args = args[:2]
 	}
 	if (action == "list" && len(args) != 1) || (action != "list" && len(args) != 2) {
-		return fmt.Errorf("usage: magpie gateway-key list | add <name> [--key <value> | --key -] [--read-only] | rotate <id> [--key <value> | --key -] | remove <id> | limit <id> [list | off | reset [<n>] | remove <n> | [add] day|week|month|<N>d|<N>h [--tokens N] [--cost USD] [--cache-reads] [--model <provider>/<model>|<provider>/* ...]] | models <id> [all | <provider>/<model>|<provider>/* ...] | accounts <id> [all | <provider>/<account>|<provider>/<key id> ...] | quotas <id> [on | off] | concurrency <id> [<n> | off] | mcp <id> [all | none | <server>|<server>/<tool> ...] | access <id> [read-only | full] | move <id> <place> | issue --ttl <duration> [--name <name>] [--models a,b] [--accounts a,b] [--tokens N] [--cost USD] [--read-only] [--from <id>] | issuer <id> [on | off] | oidc [list | add --key <id> --repo owner/name … | remove <rule id>]")
+		return fmt.Errorf("usage: magpie gateway-key list | add <name> [--key <value> | --key -] [--read-only] | rotate <id> [--key <value> | --key -] | remove <id> | limit <id> [list | off | reset [<n>] | remove <n> | [add] day|week|month|<N>d|<N>h [--tokens N] [--cost USD] [--cache-reads] [--model <provider>/<model>|<provider>/* ...]] | models <id> [all | <provider>/<model>|<provider>/* ...] | relay-models <id> [none | <provider>/<model>|<provider>/* ...] | accounts <id> [all | <provider>/<account>|<provider>/<key id> ...] | quotas <id> [on | off] | concurrency <id> [<n> | off] | mcp <id> [all | none | <server>|<server>/<tool> ...] | access <id> [read-only | full] | move <id> <place> | issue --ttl <duration> [--name <name>] [--models a,b] [--relay-models a,b] [--accounts a,b] [--tokens N] [--cost USD] [--read-only] [--from <id>] | issuer <id> [on | off] | oidc [list | add --key <id> --repo owner/name … | remove <rule id>]")
 	}
 	switch action {
 	case "list", "add", "rotate", "remove":
@@ -114,7 +118,7 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 			return err
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tNAME\tSTATE\tGATEWAY KEY\tLIMIT\tMODELS\tACCOUNTS\tACCESS")
+		fmt.Fprintln(w, "ID\tNAME\tSTATE\tGATEWAY KEY\tLIMIT\tMODELS\tRELAY MODELS\tACCOUNTS\tACCESS")
 		now := time.Now()
 		// an account is shown by who is signed in, kept by its stable id (#905)
 		names := provider.AccountNames()
@@ -139,6 +143,10 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 			if ms := access.HeldModels(k.Models, k.Accounts); len(ms) > 0 {
 				models = strings.Join(ms, ",")
 			}
+			relayModels := "none"
+			if len(k.RelayModels) > 0 {
+				relayModels = strings.Join(k.RelayModels, ",")
+			}
 			accounts := "all"
 			if len(k.Accounts) > 0 {
 				shown := make([]string, len(k.Accounts))
@@ -147,12 +155,12 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 				}
 				accounts = strings.Join(shown, ",")
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", k.ID, strings.Map(func(r rune) rune {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", k.ID, strings.Map(func(r rune) rune {
 				if r < 32 || r == 127 {
 					return ' '
 				}
 				return r
-			}, k.Name), state, k.Masked, limitWords(k, now), models, accounts, accessWord(k))
+			}, k.Name), state, k.Masked, limitWords(k, now), models, relayModels, accounts, accessWord(k))
 		}
 		return w.Flush()
 	}
@@ -483,6 +491,44 @@ func gatewayKeyModels(out io.Writer, args []string) error {
 	return err
 }
 
+// gatewayKeyRelayModels shows or sets the models a key may use through the
+// trusted relay header.
+func gatewayKeyRelayModels(out io.Writer, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: magpie gateway-key relay-models <id> [none | <provider>/<model>|<provider>/* ...]")
+	}
+	id := args[0]
+	if len(args) > 1 {
+		ms := args[1:]
+		if len(ms) == 1 {
+			switch ms[0] {
+			case "none":
+				ms = nil
+			case "all":
+				return fmt.Errorf("relay-models uses none to clear; all is not valid")
+			}
+		}
+		if _, err := access.Update("relay-models-key", access.Change{Key: id, RelayModels: ms}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	k := keys[i]
+	if len(k.RelayModels) == 0 {
+		_, err = fmt.Fprintf(out, "%s: no relay-only models\n", k.Name)
+		return err
+	}
+	_, err = fmt.Fprintf(out, "%s: only %s\n", k.Name, strings.Join(k.RelayModels, ", "))
+	return err
+}
+
 // gatewayKeyMCP shows or sets the MCP servers and tools a key may use
 // (wakaka on Discord):
 //
@@ -758,13 +804,13 @@ func gatewayKeyMove(out io.Writer, args []string) error {
 // agent, that stops working by itself), and prints its secret alone so a
 // script can take it:
 //
-//	magpie gateway-key issue --ttl 1h [--name n] [--models a,b] [--accounts a,b]
+//	magpie gateway-key issue --ttl 1h [--name n] [--models a,b] [--relay-models a,b] [--accounts a,b]
 //	                         [--tokens N] [--cost USD] [--read-only] [--from <id>]
 //
 // --from issues it under a key that may issue keys (issuer <id> on), held
 // to that key as POST /v1/magpie/keys with it would be.
 func gatewayKeyIssue(out io.Writer, args []string) error {
-	usage := fmt.Errorf("usage: magpie gateway-key issue --ttl <duration, e.g. 1h> [--name <name>] [--models <provider>/<model>,...] [--accounts <provider>/<account>,...] [--tokens N] [--cost USD] [--read-only] [--from <id>] [--json]")
+	usage := fmt.Errorf("usage: magpie gateway-key issue --ttl <duration, e.g. 1h> [--name <name>] [--models <provider>/<model>,...] [--relay-models <provider>/<model>,...] [--accounts <provider>/<account>,...] [--tokens N] [--cost USD] [--read-only] [--from <id>] [--json]")
 	var in access.Issue
 	asJSON := false
 	list := func(v string) []string {
@@ -785,7 +831,7 @@ func gatewayKeyIssue(out io.Writer, args []string) error {
 		case "--json":
 			asJSON = true
 			continue
-		case "--ttl", "--name", "--models", "--accounts", "--tokens", "--cost", "--from":
+		case "--ttl", "--name", "--models", "--relay-models", "--accounts", "--tokens", "--cost", "--from":
 		default:
 			return usage
 		}
@@ -804,6 +850,8 @@ func gatewayKeyIssue(out io.Writer, args []string) error {
 			in.Name = v
 		case "--models":
 			in.Models = list(v)
+		case "--relay-models":
+			in.RelayModels = list(v)
 		case "--accounts":
 			in.Accounts = list(v)
 		case "--tokens":

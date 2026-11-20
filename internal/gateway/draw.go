@@ -700,7 +700,7 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		}
 		keyWho, keyHeld := keyHolds(r)
 		if named && (isGroup && !groupGiven(r, keyWho, keyHeld, g, ms) || keyHeld && !isGroup && !modelAllowed(keyWho, p, model)) {
-			fail(keyModelRefusal(w, keyWho, d.Model))
+			fail(keyModelRefusal(w, keyWho, d.Model, relayRequest(r)))
 			return
 		}
 		if msg, off := modelOff(p, model, d.Model); off { // disabled by the user (#1867)
@@ -722,7 +722,7 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			}
 			t := s.drawingTries(g, ms, keeps, drawsModel)
 			if len(t) == 0 && keeps != nil {
-				fail(keyGroupRefusal(w, keyWho, d.Model, ms))
+				fail(keyGroupRefusal(w, keyWho, d.Model, ms, relayRequest(r)))
 				return
 			}
 			if len(t) > 0 {

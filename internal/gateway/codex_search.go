@@ -155,7 +155,7 @@ func (s *Server) alphaSearchAsked(w http.ResponseWriter, r *http.Request, body [
 			continue
 		}
 		for k, vs := range r.Header {
-			if codexHeader(k) {
+			if !strings.EqualFold(k, relayHeader) && codexHeader(k) {
 				req.Header[k] = vs
 			}
 		}

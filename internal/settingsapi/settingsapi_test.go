@@ -282,6 +282,24 @@ func TestQuitNoAskKeptUnlessSent(t *testing.T) {
 	}
 }
 
+func TestWarmWaitAndClaudeCacheTTLKept(t *testing.T) {
+	cur := settings.Defaults()
+	cur.WarmWait = settings.WarmWaitConfig{Off: true, Seconds: 45}
+	cur.ClaudeCacheTTL = settings.ClaudeCacheTTLConfig{
+		TTL:        "1h",
+		Groups:     []string{"claude-opus-*"},
+		Keys:       []string{"team-key"},
+		ExceptKeys: []string{"except-key"},
+	}
+	in, err := Merge([]byte(`{"theme":"dark"}`), cur, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.WarmWait != cur.WarmWait || !reflect.DeepEqual(in.ClaudeCacheTTL, cur.ClaudeCacheTTL) {
+		t.Fatalf("page save changed settings.json-only values: warm wait %+v, cache TTL %+v", in.WarmWait, in.ClaudeCacheTTL)
+	}
+}
+
 // What a reply's model name says is replyModel (ZoeCats on Discord). The
 // page sends it; a page from before it sends memberModel, which changes
 // it only when that page's switch was moved, so its save keeps a vendor

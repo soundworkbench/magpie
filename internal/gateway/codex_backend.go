@@ -2117,7 +2117,7 @@ func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		// what a proxy in front of magpie says of the caller isn't the
 		// ChatGPT backend's (proxyIdentity)
-		if !hopHeader(k) && !proxyIdentity(k) && http.CanonicalHeaderKey(k) != "Host" && http.CanonicalHeaderKey(k) != AccountHeader {
+		if !hopHeader(k) && !proxyIdentity(k) && http.CanonicalHeaderKey(k) != "Host" && http.CanonicalHeaderKey(k) != AccountHeader && http.CanonicalHeaderKey(k) != relayHeader {
 			dst[k] = vs
 		}
 	}

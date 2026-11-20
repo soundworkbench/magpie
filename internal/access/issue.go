@@ -53,8 +53,9 @@ type Issue struct {
 	TTL  time.Duration
 	// Models and Accounts hold the key as Key's do; with an issuer, each
 	// must be one the issuer may use, and none takes the issuer's.
-	Models   []string
-	Accounts []string
+	Models      []string
+	RelayModels []string
+	Accounts    []string
 	// Tokens and Cost cap what the key may spend over its whole life.
 	Tokens   int64
 	Cost     float64
@@ -66,15 +67,16 @@ type Issue struct {
 
 // Issued is a key IssueKey made, its secret told once.
 type Issued struct {
-	ID       string    `json:"id"`
-	Name     string    `json:"name"`
-	Key      string    `json:"key"`
-	Expires  time.Time `json:"expires"`
-	Issuer   string    `json:"issuer,omitempty"`
-	Models   []string  `json:"models,omitempty"`
-	Accounts []string  `json:"accounts,omitempty"`
-	Limit    *Limit    `json:"limit,omitempty"`
-	ReadOnly bool      `json:"readOnly,omitempty"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Key         string    `json:"key"`
+	Expires     time.Time `json:"expires"`
+	Issuer      string    `json:"issuer,omitempty"`
+	Models      []string  `json:"models,omitempty"`
+	RelayModels []string  `json:"relayModels,omitempty"`
+	Accounts    []string  `json:"accounts,omitempty"`
+	Limit       *Limit    `json:"limit,omitempty"`
+	ReadOnly    bool      `json:"readOnly,omitempty"`
 }
 
 // IssueKey makes a short-lived key. It never outlives its issuer, nor
@@ -103,6 +105,10 @@ func IssueKey(in Issue) (Issued, error) {
 	if err != nil {
 		return Issued{}, err
 	}
+	relayModels, err := CleanModels(in.RelayModels)
+	if err != nil {
+		return Issued{}, err
+	}
 	var accounts []string
 	if len(in.Accounts) > 0 {
 		if accounts, err = CleanAccounts(in.Accounts); err != nil {
@@ -126,6 +132,15 @@ func IssueKey(in Issue) (Issued, error) {
 		for _, m := range models {
 			if !covered(held, m) {
 				return Issued{}, fmt.Errorf("The key issuing may not use %s, so the key it issues can't either", m)
+			}
+		}
+		for _, m := range relayModels {
+			var allowed []string
+			if len(p.Models) > 0 || len(p.Accounts) > 0 {
+				allowed = append(slices.Clone(HeldModels(p.Models, p.Accounts)), p.RelayModels...)
+			}
+			if !covered(allowed, m) {
+				return Issued{}, fmt.Errorf("The key issuing may not use %s through the relay, so the key it issues can't either", m)
 			}
 		}
 		for _, a := range accounts {
@@ -155,13 +170,13 @@ func IssueKey(in Issue) (Issued, error) {
 	if err != nil {
 		return Issued{}, err
 	}
-	k := Key{ID: id, Name: name, Secret: Prefix + token, Limit: lim, Models: models, Accounts: accounts,
+	k := Key{ID: id, Name: name, Secret: Prefix + token, Limit: lim, Models: models, RelayModels: relayModels, Accounts: accounts,
 		ReadOnly: readOnly, Expires: expires, Issuer: in.Issuer}
 	keys = append(keys, k)
 	if err := save(keys); err != nil {
 		return Issued{}, err
 	}
-	return Issued{ID: k.ID, Name: k.Name, Key: k.Secret, Expires: k.Expires, Issuer: k.Issuer, Models: models, Accounts: accounts, Limit: lim, ReadOnly: readOnly}, nil
+	return Issued{ID: k.ID, Name: k.Name, Key: k.Secret, Expires: k.Expires, Issuer: k.Issuer, Models: models, RelayModels: relayModels, Accounts: accounts, Limit: lim, ReadOnly: readOnly}, nil
 }
 
 // RevokeIssued removes the issued key id. by is the key asking: it may
@@ -320,7 +335,7 @@ func ScopeBrowser(id string) error {
 
 // identityOf is who k is, folded into its issuer when it has one.
 func identityOf(k Key, keys []Key, now time.Time) (Identity, error) {
-	who := Identity{KeyID: k.ID, KeyName: k.Name, Limit: k.Limit, More: k.More, Models: HeldModels(k.Models, k.Accounts), AccountModels: len(k.Models) == 0 && len(k.Accounts) > 0, Accounts: k.Accounts, MCP: k.MCP, Quotas: k.Quotas, ReadOnly: k.ReadOnly, Browser: k.Browser, Expires: k.Expires, Issues: k.Issues && k.Issuer == "" && !k.Browser, MaxConcurrency: k.MaxConcurrency}
+	who := Identity{KeyID: k.ID, KeyName: k.Name, Limit: k.Limit, More: k.More, Models: HeldModels(k.Models, k.Accounts), RelayModels: k.RelayModels, AccountModels: len(k.Models) == 0 && len(k.Accounts) > 0, Accounts: k.Accounts, MCP: k.MCP, Quotas: k.Quotas, ReadOnly: k.ReadOnly, Browser: k.Browser, Expires: k.Expires, Issues: k.Issues && k.Issuer == "" && !k.Browser, MaxConcurrency: k.MaxConcurrency}
 	// the default key as Default tells it: marked LAN, or the id the
 	// settings name (settings read only for an unmarked key)
 	who.Default = k.LAN || (k.ID != "" && settings.Load().LANKeyID == k.ID)
@@ -339,6 +354,20 @@ func identityOf(k Key, keys []Key, now time.Time) (Identity, error) {
 			return Identity{}, &Refused{Why: fmt.Sprintf("the gateway key %q may use none of its models now: the key it was issued under no longer lets it", k.Name)}
 		}
 	}
+	if (len(p.Models) > 0 || len(p.Accounts) > 0) && len(p.RelayModels) > 0 {
+		if len(who.RelayModels) == 0 {
+			who.RelayModels = slices.Clone(p.RelayModels)
+		} else {
+			allowed := append(slices.Clone(HeldModels(p.Models, p.Accounts)), p.RelayModels...)
+			if who.RelayModels = foldModels(who.RelayModels, allowed); len(who.RelayModels) == 0 {
+				return Identity{}, &Refused{Why: fmt.Sprintf("the gateway key %q may use none of its relay models now: the key it was issued under no longer lets it", k.Name)}
+			}
+		}
+	} else if len(who.RelayModels) > 0 && (len(p.Models) > 0 || len(p.Accounts) > 0) {
+		// Clearing the issuer's relay list removes the child's relay-only
+		// allowance, while the child's ordinary models remain usable.
+		who.RelayModels = nil
+	}
 	who.Accounts = foldAccounts(who.Accounts, p.Accounts)
 	who.ReadOnly = who.ReadOnly || p.ReadOnly
 	who.Browser = who.Browser || p.Browser
@@ -346,7 +375,7 @@ func identityOf(k Key, keys []Key, now time.Time) (Identity, error) {
 	if !p.Expires.IsZero() && (who.Expires.IsZero() || p.Expires.Before(who.Expires)) {
 		who.Expires = p.Expires
 	}
-	who.Issuer = &Identity{KeyID: p.ID, KeyName: p.Name, Limit: p.Limit, More: p.More, MCP: p.MCP, MaxConcurrency: p.MaxConcurrency}
+	who.Issuer = &Identity{KeyID: p.ID, KeyName: p.Name, Limit: p.Limit, More: p.More, RelayModels: p.RelayModels, MCP: p.MCP, MaxConcurrency: p.MaxConcurrency}
 	return who, nil
 }
 

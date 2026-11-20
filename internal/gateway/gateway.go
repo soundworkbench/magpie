@@ -589,7 +589,9 @@ type Server struct {
 	blind sync.Map
 	// the requests out at each key or account with a MaxConcurrency, and
 	// those waiting their turn (concurrency.go)
-	lanes lanes
+	lanes             lanes
+	warmWait          warmWaitCounters
+	claudeCacheForced atomic.Int64
 	// the requests in flight of each gateway key with a MaxConcurrency,
 	// and those waiting their turn (key_slots.go)
 	keyLanes lanes
@@ -1874,6 +1876,7 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Anthropic, 400, err.Error())
 		return
 	}
+	r = r.WithContext(s.withClaudeCacheTTL(r.Context(), model))
 	named := unprefixed(model)
 	if m := claudeTierStandIn(r, agentOf(r), model); m != "" {
 		model = m // counted on the model the request will go to
@@ -2309,6 +2312,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	maskDone, sentWhole := false, false
 	unmask := func() {}
 	askedFor := modelOf(body) // as it reaches serve, which an error in its stream names (keptAlive)
+	r = r.WithContext(s.withClaudeCacheTTL(r.Context(), askedFor))
 	// the reply's model the one asked for when it went out under another
 	// name, or the member that answered, when asked for (#822). Both
 	// writers hold a whole body until the handler is done, the namer
@@ -2666,7 +2670,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		if isGroup {
 			checked = g.Ref()
 		}
-		st, msg := keyModelRefusal(w, keyWho, checked)
+		st, msg := keyModelRefusal(w, keyWho, checked, relayRequest(r))
 		call.Status, call.Error = st, "model not allowed for the gateway key"
 		if st == http.StatusTooManyRequests {
 			call.Error, call.Usage.ErrType = msg, "gateway_key_limit"
@@ -3321,7 +3325,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	if from == provider.Gemini {
 		streams = strings.Contains(r.URL.Path, "streamGenerateContent")
 	}
-	gaveWay := map[string]bool{} // keys and accounts that gave way, full, to one free (laneMate, waitMate)
+	warmTried := map[string]bool{} // an account already asked cannot claim another warm wait
+	gaveWay := map[string]bool{}   // keys and accounts that gave way, full, to one free (laneMate, waitMate)
 	// the slot a request waiting in a full lane took of the key or account
 	// it went to instead (waitMate), for that one's try; given back if it
 	// isn't the one tried next, or when serve ends with it unused
@@ -3416,8 +3421,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			handed.release()
 			handed.release = nil
 		}
-		if handed.release != nil {
-			// it holds a slot of this one already: no giving way
+		warmDelay := s.warmWaitFor(c, aff, warmTried[c.who()], gaveWay[c.who()], plannedOrder)
+		if handed.release != nil || warmDelay > 0 {
+			// A reserved slot or a hot cache keeps this lane ahead of mates.
 		} else if j := s.laneMate(cands, i, isGroup, gaveWay); j > i {
 			// its key or account is full, and another of its provider's,
 			// or of its group, has a slot free: that one is asked first,
@@ -3889,6 +3895,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		heldRestricted := false // held as an account its vendor restricted (restrictedHeld)
 		var heldBack time.Time  // when the first of those held out of their allowance is back
 		var queued int64        // ms it waited for a slot of its key's or account's
+		var warmQueued int64    // of its lane wait, the one protecting a hot cache
 		var laneErr error       // turned away by its key's or account's queue
 		at := &wireAt{}         // the level a translated request was built at
 		// the models Copilot's Auto picked for it, where from, and which
@@ -4025,7 +4032,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				// room, not resting, once there is one (01huadalang on
 				// Discord: the requests already waiting for a third ZCode
 				// account waited on once the first two were back)
-				release, inLane, err = s.lanes.take(ctx, c.who(), c.p.LaneLimit(), c.p.QueueLimit, time.Duration(c.p.QueueWait)*time.Second, func() (bool, time.Time) {
+				// Recheck after the gateway key wait: no grace for a lane
+				// that is now resting or has exhausted its minute.
+				warmDelay = s.warmWaitFor(c, aff, warmTried[c.who()], gaveWay[c.who()], plannedOrder)
+				var warm *WarmWaitHop
+				release, inLane, err, warm = s.takeWarm(ctx, c, warmDelay, stuck, func() (bool, time.Time) {
 					m, rel, next, ok := s.waitMate(cands, i, isGroup, gaveWay, all)
 					if !ok {
 						return false, next
@@ -4033,6 +4044,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					mate, handed.who, handed.release = m, m.who(), rel
 					return true, time.Time{}
 				})
+				if warm != nil {
+					warmQueued = warm.Millis
+					s.trace.update(tr, func(t *Route) {
+						t.WarmWait = append(t.WarmWait, *warm)
+						t.Tries[len(t.Tries)-1].WarmWait = warm.Millis
+					})
+				}
 			}
 			if errors.Is(err, errMoved) {
 				// nothing was sent, and nobody failed: the one with room is
@@ -4089,6 +4107,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			handed.release()
 			handed.release = nil
 		}
+		warmTried[c.who()] = true
 		if laneErr != nil {
 			// its key's or account's queue was full, or it waited as long
 			// as it may: nobody failed, and nobody rests; the next is
@@ -4185,7 +4204,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		ended = time.Now()
 		try := Try{ID: c.rest, Model: c.model, Effort: wentAt, Picked: picked, Fixed: fixed, RuleEffort: ruled, MappedFrom: mappedFrom, Fast: fast, Start: began, Done: true, Status: call.Status, Millis: ended.Sub(began).Milliseconds(), Error: call.Error, Queued: queued,
 			Served: call.Usage.Served, Upstream: call.Usage.Upstream, Pin: c.p.ClinePassAsked(c.model), Tier: wentTier, TierServed: call.Usage.Tier, Auto: autoPicked(),
-			Net: nt.timing(began, queued), SentBy: sentBy(c.p)}
+			Net: nt.timing(began, queued), SentBy: sentBy(c.p), WarmWait: warmQueued}
 		if resetFirst != nil {
 			// the reset spent for it before it was asked
 			try.Reset, resetFirst = resetFirst, nil
@@ -6080,6 +6099,9 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		passOnUA(req, ua)
 		markSearching(ctx, req)
 	}
+	// The relay token authenticates only this gateway hop; never expose it
+	// to a provider, another magpie, or any translated upstream request.
+	dropRelayHeader(req.Header)
 	if err := p.Sign(ctx, req, to, body); err != nil {
 		return nil, err
 	}

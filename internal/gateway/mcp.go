@@ -32,6 +32,7 @@ var mcpHop = map[string]bool{
 	"Authorization": true, "Host": true, "Connection": true, "Keep-Alive": true,
 	"Proxy-Authorization": true, "Proxy-Connection": true, "Te": true, "Trailer": true,
 	"Transfer-Encoding": true, "Upgrade": true, "Content-Length": true, "Accept-Encoding": true,
+	relayHeader: true,
 }
 
 // RunMCP serves /mcp/run/<server>: a server magpie runs by its command,

@@ -107,6 +107,7 @@ type Affinity struct {
 	CacheRead  int       `json:"cacheRead,omitempty"`  // tokens that answer read from the vendor's cache
 	CacheWrite int       `json:"cacheWrite,omitempty"` // and wrote to it, or was sent where none is
 	Kept       bool      `json:"kept,omitempty"`       // Last was put first for it
+	Warm       bool      `json:"warm,omitempty"`       // its answerer's cache is still worth keeping
 	// Why it was kept — "session", "turn", "cache" — or not: "off", "first"
 	// (nobody has answered it yet), "new-turn", "no-cache" (the vendor
 	// read and wrote too little of its cache to keep, or was sent too
@@ -577,6 +578,9 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 			}
 		}
 	}
+	if had && at >= 0 {
+		a.Warm = cacheHolds(st, cs[at].p)
+	}
 	// A load seat becomes an ordinary backup once an earlier candidate
 	// actually fails. Forget its load exemption, including for fallbacks
 	// whose candidates have no group place for standsInFor to remember.
@@ -727,8 +731,12 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 			cs, pl = leastHeld(scope, key, cs, pl, true)
 		}
 	}
+	warmLast := a.Last
 	if !rotate {
 		cs, pl = withSession(scope, key, sessionNamed(in), a, st, had, cs, pl)
+	}
+	if a.Last != warmLast {
+		a.Warm = false // a session lead is not this conversation's cache
 	}
 	// A load mark describes a new seat, never a transient order seen by a
 	// kept conversation. Carry the previous mark only while it keeps its seat.

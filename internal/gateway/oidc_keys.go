@@ -58,8 +58,9 @@ func (s *Server) oidcIssueKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		TTL    json.RawMessage `json:"ttl"`
-		Models []string        `json:"models"`
+		TTL         json.RawMessage `json:"ttl"`
+		Models      []string        `json:"models"`
+		RelayModels []string        `json:"relayModels"`
 	}
 	if b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20)); len(strings.TrimSpace(string(b))) > 0 {
 		if err := json.Unmarshal(b, &in); err != nil {
@@ -76,7 +77,7 @@ func (s *Server) oidcIssueKey(w http.ResponseWriter, r *http.Request) {
 		}
 		ttl = min(asked, ttl) // never longer than the rule says
 	}
-	k, err := access.IssueKey(access.Issue{Name: oidcKeyName(claims), TTL: ttl, Models: in.Models, Issuer: rule.Key})
+	k, err := access.IssueKey(access.Issue{Name: oidcKeyName(claims), TTL: ttl, Models: in.Models, RelayModels: in.RelayModels, Issuer: rule.Key})
 	if err != nil {
 		writeError(w, provider.Chat, http.StatusBadRequest, err.Error())
 		return

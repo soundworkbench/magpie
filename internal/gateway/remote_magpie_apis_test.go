@@ -93,6 +93,7 @@ func TestRemoteMagpieSystemOne(t *testing.T) {
 	for _, model := range models {
 		req := httptest.NewRequest("POST", "/v1/systemone", strings.NewReader(`{"model":"office/judge/`+model+`","state":{"message":"hello"},"questions":{"ok":{"type":"noul"}}}`))
 		req.Header.Set("User-Agent", "pi/1.0")
+		req.Header.Set(relayHeader, "relay-secret")
 		req.Header.Set(SessionHeader, "decision-session")
 		req.Header.Set("session_id", "native-session")
 		rec := httptest.NewRecorder()
@@ -120,6 +121,9 @@ func TestRemoteMagpieSystemOne(t *testing.T) {
 		}
 		if h.head.Get("Authorization") != "Bearer remote-key" || h.head.Get(AgentHeader) != "pi" || h.head.Get(ViaHeader) == "" || h.head.Get(SessionHeader) != "decision-session" || h.head.Get("session_id") != "native-session" || !strings.HasPrefix(h.head.Get("User-Agent"), "magpie/") {
 			t.Errorf("remote caller: %v", h.head)
+		}
+		if h.head.Get(relayHeader) != "" {
+			t.Errorf("relay token reached remote magpie: %v", h.head)
 		}
 	}
 	if route := s.trace.routes[0]; route.Agent != "pi" || route.Session != "decision-session" || !route.Done {

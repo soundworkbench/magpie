@@ -626,7 +626,7 @@ func (s *Server) serveSystemOneBody(w http.ResponseWriter, r *http.Request, body
 	// a gateway key held to some models (#882) is refused another; a
 	// decision model is a model, and System One asks one directly
 	if keyWho, held := keyHolds(r); held && !modelAllowed(keyWho, p, model) {
-		st, msg := keyModelRefusal(w, keyWho, p.ID+"/"+model)
+		st, msg := keyModelRefusal(w, keyWho, p.ID+"/"+model, relayRequest(r))
 		writeError(w, provider.Chat, st, msg)
 		return
 	}

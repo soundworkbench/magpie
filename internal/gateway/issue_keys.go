@@ -34,12 +34,13 @@ const KeysPath = "/v1/magpie/keys"
 type issuedKeyBody struct {
 	Name string `json:"name"`
 	// TTL is a Go duration ("1h", "30m") or a number of seconds.
-	TTL      json.RawMessage `json:"ttl"`
-	Models   []string        `json:"models"`
-	Accounts []string        `json:"accounts"`
-	Tokens   int64           `json:"tokens"`
-	Cost     float64         `json:"cost"`
-	ReadOnly bool            `json:"readOnly"`
+	TTL         json.RawMessage `json:"ttl"`
+	Models      []string        `json:"models"`
+	RelayModels []string        `json:"relayModels"`
+	Accounts    []string        `json:"accounts"`
+	Tokens      int64           `json:"tokens"`
+	Cost        float64         `json:"cost"`
+	ReadOnly    bool            `json:"readOnly"`
 }
 
 // keyIssuer is the id of the key r issues under ("" for the user, over
@@ -78,7 +79,7 @@ func (s *Server) issueKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, http.StatusBadRequest, err.Error())
 		return
 	}
-	k, err := access.IssueKey(access.Issue{Name: in.Name, TTL: ttl, Models: in.Models, Accounts: in.Accounts,
+	k, err := access.IssueKey(access.Issue{Name: in.Name, TTL: ttl, Models: in.Models, RelayModels: in.RelayModels, Accounts: in.Accounts,
 		Tokens: in.Tokens, Cost: in.Cost, ReadOnly: in.ReadOnly, Issuer: by})
 	if err != nil {
 		writeError(w, provider.Chat, http.StatusBadRequest, err.Error())
@@ -104,6 +105,9 @@ func (s *Server) issuedKeys(w http.ResponseWriter, r *http.Request) {
 		e := map[string]any{"id": k.ID, "name": k.Name, "key": k.Masked, "expires": k.Expires, "expired": !time.Now().Before(k.Expires)}
 		if len(k.Models) > 0 {
 			e["models"] = k.Models
+		}
+		if len(k.RelayModels) > 0 {
+			e["relayModels"] = k.RelayModels
 		}
 		if len(k.Accounts) > 0 {
 			e["accounts"] = k.Accounts

@@ -29,6 +29,7 @@ func codexSearchPost(h http.Handler, path, body string) *httptest.ResponseRecord
 	r.Header.Set("x-openai-actor-authorization", "magpie")
 	r.Header.Set("x-codex-turn-metadata", `{"turn_id":"t1"}`)
 	r.Header.Set("originator", "codex_exec")
+	r.Header.Set(relayHeader, "relay-secret")
 	r.Header.Set("User-Agent", "codex_exec/0.162.1 (Linux 6.8; x86_64)")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -101,7 +102,7 @@ func TestCodexWebRunSearchesOnChatGPTAccount(t *testing.T) {
 			if paths[i] != "/backend-api/codex/alpha/search" {
 				t.Fatalf("%s: went to %s", path, paths[i])
 			}
-			if a := hd.Get("Authorization"); a == "" || a == "Bearer magpie" || hd.Get("x-openai-actor-authorization") != "" {
+			if a := hd.Get("Authorization"); a == "" || a == "Bearer magpie" || hd.Get("x-openai-actor-authorization") != "" || hd.Get(relayHeader) != "" {
 				t.Fatalf("%s: magpie's own token or actor header went on: %v", path, hd)
 			}
 			if hd.Get("x-codex-turn-metadata") != `{"turn_id":"t1"}` || hd.Get("originator") != "codex_cli_rs" || hd.Get("Accept") == "text/event-stream" {

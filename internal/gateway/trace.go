@@ -118,6 +118,9 @@ type Route struct {
 	Order    []Weighed    `json:"order"`              // who was to try it, first first
 	Left     []Weighed    `json:"left,omitempty"`
 	Tries    []Try        `json:"tries"`
+
+	// WarmWait keeps waits whose unsent tries were removed after giving way.
+	WarmWait []WarmWaitHop `json:"warmWait,omitempty"`
 	// Masked: what masking swapped in the request before it went, nil
 	// for nothing (noteMasked)
 	Masked *Masked `json:"masked,omitempty"`
@@ -553,7 +556,8 @@ type Try struct {
 	errType string
 	// Queued: ms it waited for one of its key's or account's slots, the
 	// provider's MaxConcurrency out already (concurrency.go)
-	Queued int64 `json:"queued,omitempty"`
+	Queued   int64 `json:"queued,omitempty"`
+	WarmWait int64 `json:"warmWait,omitempty"` // milliseconds waiting to preserve a hot cache
 	// Net: where its time went up to its reply's first byte (TryNet)
 	Net *TryNet `json:"net,omitempty"`
 	// Reset: its week used up and nobody else left, one of the account's
@@ -935,6 +939,7 @@ func (t *trace) update(r *Route, f func(r *Route)) {
 			c.Order = append([]Weighed{}, r.Order...) // [] for none: the GUI reads it as a list
 			c.Left = append([]Weighed(nil), r.Left...)
 			c.Tries = append([]Try{}, r.Tries...)
+			c.WarmWait = append([]WarmWaitHop(nil), r.WarmWait...)
 			c.Usage = append([]RouteUsage(nil), r.Usage...)
 			go saveRoute(c)
 		}
@@ -1108,6 +1113,7 @@ func (s *Server) Trace(ctx context.Context, after int64, wait time.Duration) Tra
 				c.Order = append([]Weighed{}, r.Order...) // [] for none: the GUI reads it as a list
 				c.Left = append([]Weighed(nil), r.Left...)
 				c.Tries = append([]Try{}, r.Tries...)
+				c.WarmWait = append([]WarmWaitHop(nil), r.WarmWait...)
 				c.Usage = append([]RouteUsage(nil), r.Usage...)
 				st.Routes = append(st.Routes, c)
 			}

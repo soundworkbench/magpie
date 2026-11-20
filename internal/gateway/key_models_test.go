@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -151,6 +154,124 @@ func TestGatewayKeyModelsMatchTheServingProvider(t *testing.T) {
 	}
 	if membersAllowed(who, nil) || !membersAllowed(access.Identity{}, nil) {
 		t.Fatal("an empty group")
+	}
+}
+
+func TestGatewayKeyRelayModelsOnlyApplyWithRelayToken(t *testing.T) {
+	fresh(t)
+	plan := &fake{t: t, ctype: "application/json", reply: `{"id":"plan","choices":[]}`}
+	spare := &fake{t: t, ctype: "application/json", reply: `{"id":"relay","choices":[]}`}
+	twoProviders(t, plan, spare)
+	keys, secrets := newCaller(t, "Relay")
+	if _, err := access.Update("models-key", access.Change{Key: keys[0].ID, Models: []string{"plan/*"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := access.Update("relay-models-key", access.Change{Key: keys[0].ID, RelayModels: []string{"spare/*"}}); err != nil {
+		t.Fatal(err)
+	}
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("relay-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_RELAY_TOKEN_FILE", token)
+	h := lanGuard(New().Handler())
+	call := func(model, relay string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`))
+		r.RemoteAddr = "127.0.0.1:51234"
+		r.Header.Set("Authorization", "Bearer "+secrets[0])
+		r.Header.Set("X-Forwarded-For", "10.0.0.2")
+		if relay != "" {
+			r.Header.Set("X-Magpie-Relay", relay)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := call("spare/m2", "relay-token"); w.Code != http.StatusOK || spare.calls != 1 {
+		t.Fatalf("relay model: %d %s, calls=%d", w.Code, w.Body.String(), spare.calls)
+	}
+	if spare.head.Get(relayHeader) != "" {
+		t.Fatalf("relay token reached chat upstream: %v", spare.head)
+	}
+	list := func(relay string) []string {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.RemoteAddr = "127.0.0.1:51234"
+		r.Header.Set("Authorization", "Bearer "+secrets[0])
+		r.Header.Set("X-Forwarded-For", "10.0.0.2")
+		if relay != "" {
+			r.Header.Set("X-Magpie-Relay", relay)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("model list: %d %s", w.Code, w.Body.String())
+		}
+		var got struct{ Data []struct{ ID string } }
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]string, 0, len(got.Data))
+		for _, m := range got.Data {
+			ids = append(ids, m.ID)
+		}
+		return ids
+	}
+	if ids := list("relay-token"); !slices.Contains(ids, "spare/m2") {
+		t.Fatalf("relay model list: %v", ids)
+	}
+	if ids := list(""); slices.Contains(ids, "spare/m2") {
+		t.Fatalf("public model list exposed relay model: %v", ids)
+	}
+	if w := call("spare/m2", ""); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "只能在工作伙伴里") {
+		t.Fatalf("public relay-only model: %d %s", w.Code, w.Body.String())
+	}
+	if w := call("spare/m2", "wrong"); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "只能在工作伙伴里") {
+		t.Fatalf("invalid relay token: %d %s", w.Code, w.Body.String())
+	}
+	if w := call("plan/m1", ""); w.Code != http.StatusOK {
+		t.Fatalf("ordinary model: %d %s", w.Code, w.Body.String())
+	}
+	if w := call("plan/m1", "relay-token"); w.Code != http.StatusOK {
+		t.Fatalf("ordinary model with valid relay token: %d %s", w.Code, w.Body.String())
+	}
+	if w := call("plan/m1", "wrong"); w.Code != http.StatusOK {
+		t.Fatalf("ordinary model with wrong relay token: %d %s", w.Code, w.Body.String())
+	}
+	local := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"spare/m2","messages":[{"role":"user","content":"hi"}]}`))
+	local.Header.Set("Authorization", "Bearer "+secrets[0])
+	local.RemoteAddr = "127.0.0.1:51234"
+	localRec := httptest.NewRecorder()
+	h.ServeHTTP(localRec, local)
+	if localRec.Code != http.StatusForbidden {
+		// A local request still has the ordinary model restriction; it must
+		// not gain relay-only models merely by being on loopback.
+		t.Fatalf("local request unexpectedly bypassed model restriction: %d %s", localRec.Code, localRec.Body.String())
+	}
+	local = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"spare/m2","messages":[{"role":"user","content":"hi"}]}`))
+	local.RemoteAddr = "127.0.0.1:51234"
+	localRec = httptest.NewRecorder()
+	h.ServeHTTP(localRec, local)
+	if localRec.Code != http.StatusOK {
+		t.Fatalf("unkeyed local request changed: %d %s", localRec.Code, localRec.Body.String())
+	}
+}
+
+func TestRelayModelsDoNotExpandAccountDerivedModels(t *testing.T) {
+	r := httptest.NewRequest("GET", "/v1/models", nil)
+	r = r.WithContext(context.WithValue(r.Context(), relayRequestKey{}, true))
+	who := relayModelsFor(r, access.Identity{Models: []string{"codex/*"}, RelayModels: []string{"claude/*"}, AccountModels: true})
+	if modelAllowed(who, provider.Provider{ID: "claude"}, "opus") {
+		t.Fatal("account-derived models gained relay-only models")
+	}
+}
+
+func TestRelayModelErrorKeepsOrdinaryMessageOnRelay(t *testing.T) {
+	who := access.Identity{KeyName: "Relay", Models: []string{"codex/*"}, RelayModels: []string{"claude/*"}}
+	if got := keyModelError(who, "claude/opus", true); strings.Contains(got, "只能在工作伙伴里") {
+		t.Fatalf("relay refusal used ordinary model restriction message: %s", got)
+	}
+	if got := keyModelError(who, "claude/opus", false); !strings.Contains(got, "只能在工作伙伴里") {
+		t.Fatalf("ordinary refusal lost relay-only explanation: %s", got)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/budget"
@@ -554,7 +555,24 @@ func (s *Server) Relisten() error {
 // including a stale named key.
 func lanGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if ownCallback(r) {
+		hasRelay := relayHeaderPresent(r)
+		if hasRelay {
+			token := relayToken()
+			valid := token != "" && subtle.ConstantTimeCompare([]byte(relayHeaderValue(r)), []byte(token)) == 1
+			if !valid {
+				if token == "" {
+					logRelayTokenUnconfigured(r)
+				} else {
+					log.Printf("request carried an invalid %s header", relayHeader)
+				}
+			}
+			ctx := context.WithValue(r.Context(), relayRequestKey{}, valid)
+			ctx = context.WithValue(ctx, relayHeaderKey{}, true)
+			r = r.WithContext(ctx)
+			r.Header = r.Header.Clone()
+			dropRelayHeader(r.Header)
+		}
+		if !hasRelay && ownCallback(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -602,38 +620,38 @@ func lanGuard(next http.Handler) http.Handler {
 		// passes some on (a page on this computer, the request's own
 		// origin, an app's scheme), and a route that takes OPTIONS
 		// (Codex's relay, the MCP paths) would serve it with no key.
-		if remote && corsPreflight(r) && corsAllowed(r.Header.Get("Origin")) {
+		if remote && !hasRelay && corsPreflight(r) && corsAllowed(r.Header.Get("Origin")) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		// the key page itself is the same bytes for everyone, so it is
 		// opened before the key it asks for is typed; its data isn't
-		if remote && keyPageOpen(r) {
+		if remote && !hasRelay && keyPageOpen(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		// a link the image server handed out opens with its own token
 		// and no key (imageTokenAsked); the handler judges the token, and
 		// refuses one that opens nothing as a request without a key
-		if remote && imageTokenAsked(r) {
+		if remote && !hasRelay && imageTokenAsked(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		// a CI job's OIDC token traded for a key carries the token, not a
 		// key: the handler verifies it, and counts one it refuses against
 		// tooManyAuthFails (oidc_keys.go)
-		if remote && oidcExchange(r) {
+		if remote && !hasRelay && oidcExchange(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		// a magpie's proof that it holds a key is asked with none: the
 		// handler answers only a key's holder, refuses a browser, and
 		// counts an unknown key against tooManyAuthFails (remote_prove.go)
-		if remote && proveAsked(r) {
+		if remote && !hasRelay && proveAsked(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if remote || managedKey(r) {
+		if remote || hasRelay || managedKey(r) {
 			var ok bool
 			r, ok = identifyCaller(w, r)
 			if !ok {
@@ -653,6 +671,104 @@ var callbacks = struct {
 	sync.Mutex
 	tokens map[string]bool
 }{tokens: map[string]bool{}}
+
+const relayHeader = "X-Magpie-Relay"
+const relayTokenFileEnv = "MAGPIE_RELAY_TOKEN_FILE"
+
+type relayRequestKey struct{}
+type relayHeaderKey struct{}
+
+func relayRequest(r *http.Request) bool {
+	return relayRequestFromContext(r.Context())
+}
+
+func relayRequestFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(relayRequestKey{}).(bool)
+	return v
+}
+
+func relayHeaderSent(r *http.Request) bool {
+	if relayHeaderPresent(r) {
+		return true
+	}
+	v, _ := r.Context().Value(relayHeaderKey{}).(bool)
+	return v
+}
+
+func relayHeaderPresent(r *http.Request) bool {
+	for k := range r.Header {
+		if strings.EqualFold(k, relayHeader) {
+			return true
+		}
+	}
+	return false
+}
+
+func relayHeaderValue(r *http.Request) string {
+	for k, vs := range r.Header {
+		if strings.EqualFold(k, relayHeader) && len(vs) > 0 {
+			return vs[0]
+		}
+	}
+	return ""
+}
+
+func dropRelayHeader(h http.Header) {
+	for k := range h {
+		if strings.EqualFold(k, relayHeader) {
+			delete(h, k)
+		}
+	}
+}
+
+var relayTokenLog struct {
+	sync.Mutex
+	failed map[string]bool
+}
+
+var relayTokenUnconfiguredLog struct {
+	sync.Mutex
+	last map[string]time.Time
+}
+
+func logRelayTokenUnconfigured(r *http.Request) {
+	source := clientIP(r)
+	if source == "" {
+		source = r.RemoteAddr
+	}
+	now := time.Now()
+	relayTokenUnconfiguredLog.Lock()
+	defer relayTokenUnconfiguredLog.Unlock()
+	if relayTokenUnconfiguredLog.last == nil {
+		relayTokenUnconfiguredLog.last = map[string]time.Time{}
+	}
+	if last := relayTokenUnconfiguredLog.last[source]; now.Sub(last) < time.Minute {
+		return
+	}
+	relayTokenUnconfiguredLog.last[source] = now
+	log.Printf("request carried %s, but the relay token is not configured (中转暗号未配置)", relayHeader)
+}
+
+func relayToken() string {
+	path := strings.TrimSpace(os.Getenv(relayTokenFileEnv))
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		relayTokenLog.Lock()
+		if relayTokenLog.failed == nil {
+			relayTokenLog.failed = map[string]bool{}
+		}
+		if !relayTokenLog.failed[path] {
+			relayTokenLog.failed[path] = true
+			log.Printf("relay token file %q could not be read: %v", path, err)
+		}
+		relayTokenLog.Unlock()
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
 
 // addCallback makes token, a run's callback token (randomToken: 24 bytes
 // from crypto/rand), one ownCallback takes, until dropCallback.
@@ -764,7 +880,7 @@ func ownHost(host string) bool {
 // callerGuard also covers embedded handlers used by the web app and tests.
 func callerGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if access.Caller(r.Context()).KeyID == "" && managedKey(r) && (local(r) || remoteKeyed()) {
+		if access.Caller(r.Context()).KeyID == "" && managedKey(r) && (local(r) || remoteKeyed() || relayHeaderSent(r)) {
 			var ok bool
 			r, ok = identifyCaller(w, r)
 			if !ok {
@@ -798,7 +914,7 @@ func identifyCaller(w http.ResponseWriter, r *http.Request) (*http.Request, bool
 		writeError(w, provider.Chat, http.StatusUnauthorized, refused.Why)
 		return r, false
 	}
-	if !ok && !local(r) {
+	if !ok && (!local(r) || relayHeaderSent(r)) {
 		if over, retry := tooManyAuthFails(); over {
 			// A flood of wrong keys: stop answering each one (no 401 oracle,
 			// no unbounded work) until the bucket refills. A valid key never
@@ -850,6 +966,7 @@ func appendUsage(r *http.Request, rec usage.Record) {
 	}
 	who := access.Caller(r.Context())
 	rec.CallerKeyID, rec.CallerKeyName, rec.CallerIssuerID = who.KeyID, who.KeyName, who.IssuerID()
+	rec.Relay = relayRequest(r)
 	rec.Local = local(r)
 	rec.ClientIP = clientIP(r)
 	if r.Context().Value(observedKey{}) != nil {

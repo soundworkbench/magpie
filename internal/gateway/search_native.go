@@ -107,6 +107,6 @@ func logNativeSearches(ctx context.Context, n int, at time.Time, agent, provider
 	for range min(n, maxNativeSearchRows) {
 		budget.Append(usage.Record{Time: at, Agent: cmp.Or(agent, "magpie"), Kind: "web_search", Source: usage.SourceSearch,
 			Provider: providerID, Host: host, Requested: model, Model: model, Status: http.StatusOK,
-			CallerKeyID: who.KeyID, CallerKeyName: who.KeyName, CallerIssuerID: who.IssuerID()})
+			CallerKeyID: who.KeyID, CallerKeyName: who.KeyName, CallerIssuerID: who.IssuerID(), Relay: relayRequestFromContext(ctx)})
 	}
 }

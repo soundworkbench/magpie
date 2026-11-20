@@ -145,6 +145,9 @@ type Key struct {
 	// "<provider>/*" or a group's "group/<name>"; none for every model,
 	// unless it lists accounts: then its accounts' providers' (HeldModels).
 	Models []string `json:"models,omitempty"`
+	// RelayModels are additional models the key may use on a trusted relay
+	// request. They have no effect on ordinary requests.
+	RelayModels []string `json:"relayModels,omitempty"`
 	// Accounts are the accounts and keys the key may use (#905), as
 	// "<provider>/<account>": a signed-in account by its stable id, a
 	// key by its fingerprint; none for every account, as keys always did.
@@ -200,6 +203,7 @@ type Identity struct {
 	Limit          *Limit
 	More           []Limit
 	Models         []string
+	RelayModels    []string
 	// AccountModels says Models are only HeldModels' "<provider>/*" of
 	// a key that names accounts and no model, nor does the key it was
 	// issued under: every model of those accounts' providers is the
@@ -418,6 +422,8 @@ type Change struct {
 	Index *int `json:"index,omitempty"`
 	// Models is what "models-key" sets; none lets the key use every model.
 	Models []string `json:"models,omitempty"`
+	// RelayModels is what "relay-models-key" sets.
+	RelayModels []string `json:"relayModels,omitempty"`
 	// Accounts is what "accounts-key" sets (#905); none lets the key use
 	// every account and key.
 	Accounts []string `json:"accounts,omitempty"`
@@ -583,6 +589,12 @@ func Update(action string, in Change) (string, error) {
 				return "", err
 			}
 			keys[i].Models = ms
+		case "relay-models-key":
+			ms, err := CleanModels(in.RelayModels)
+			if err != nil {
+				return "", err
+			}
+			keys[i].RelayModels = ms
 		case "accounts-key":
 			as, err := CleanAccounts(in.Accounts)
 			if err != nil {
@@ -647,7 +659,7 @@ func Update(action string, in Change) (string, error) {
 		default:
 			return "", fmt.Errorf("unknown key action %q", action)
 		}
-		if defaultKey && action != "remove-key" && action != "rename-key" && action != "limit-key" && action != "reset-limit-key" && action != "models-key" && action != "accounts-key" && action != "mcp-key" && action != "quotas-key" && action != "concurrency-key" && action != "access-key" && action != "issuer-key" && action != "move-key" {
+		if defaultKey && action != "remove-key" && action != "rename-key" && action != "limit-key" && action != "reset-limit-key" && action != "models-key" && action != "relay-models-key" && action != "accounts-key" && action != "mcp-key" && action != "quotas-key" && action != "concurrency-key" && action != "access-key" && action != "issuer-key" && action != "move-key" {
 			mirror = &keys[i]
 		}
 	}

@@ -42,7 +42,7 @@ func TestMCPProxy(t *testing.T) {
 	}
 	token, _ := mcpauth.Token(t.Context(), "neon")
 
-	resp := call("POST", `{"jsonrpc":"2.0","id":1,"method":"initialize"}`, "X-Team", "acme", "MCP-Protocol-Version", "2025-06-18")
+	resp := call("POST", `{"jsonrpc":"2.0","id":1,"method":"initialize"}`, relayHeader, "relay-secret", "X-Team", "acme", "MCP-Protocol-Version", "2025-06-18")
 	b, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != 200 || !strings.Contains(string(b), `"method":"initialize"`) || resp.Header.Get("Mcp-Session-Id") != "sess-1" {
@@ -53,6 +53,9 @@ func TestMCPProxy(t *testing.T) {
 	}
 	if f.Seen.Get("X-Team") != "acme" || f.Seen.Get("Mcp-Protocol-Version") != "2025-06-18" {
 		t.Fatalf("headers not passed on: %v", f.Seen)
+	}
+	if f.Seen.Get(relayHeader) != "" {
+		t.Fatalf("relay token reached MCP server: %v", f.Seen)
 	}
 
 	// a call answered as an event stream comes through as one
