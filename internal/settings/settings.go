@@ -417,6 +417,9 @@ type Settings struct {
 
 	// LoadGuard is this machine's own, changed through settings.json.
 	LoadGuard LoadGuardConfig `json:"loadGuard,omitzero"`
+	// These routing policies travel with the normal settings sync.
+	WarmWait       WarmWaitConfig       `json:"warmWait,omitzero"`
+	ClaudeCacheTTL ClaudeCacheTTLConfig `json:"claudeCacheTTL,omitzero"`
 	// RefusalRetries is how many more times a request the vendor's safety
 	// filter refused, with nothing said, is asked of another account or
 	// routing group member (#248), unset for every one left. 0 hands the

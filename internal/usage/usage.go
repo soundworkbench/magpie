@@ -44,6 +44,7 @@ type Record struct {
 	ProviderAccount string `json:"providerAccount,omitempty"`
 	CallerKeyID     string `json:"callerKeyId,omitempty"`
 	CallerKeyName   string `json:"callerKeyName,omitempty"`
+	Relay           bool   `json:"relay,omitempty"`
 	// CallerIssuerID is the key CallerKeyID was issued under (an issued,
 	// short-lived key: access.IssueKey), whose limits count this call too.
 	CallerIssuerID string `json:"callerIssuerId,omitempty"`

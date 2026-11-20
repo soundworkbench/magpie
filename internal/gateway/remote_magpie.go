@@ -114,6 +114,7 @@ func withCaller(next http.Handler) http.Handler {
 		r.Header.Del(ClientUAHeader)
 		r.Header.Del(ClaudeCacheTTLHeader)
 		r.Header.Del(MaskedAsHeader)
+		dropRelayHeader(r.Header)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -234,6 +235,9 @@ func passOnCaller(ctx context.Context, req *http.Request) {
 		// settings, doesn't again
 		req.Header.Set(MaskedAsHeader, fp)
 	}
+	if v := remoteClaudeTTL(ctx, c); v != "" {
+		req.Header.Set(ClaudeCacheTTLHeader, v)
+	}
 	if !ok {
 		return
 	}
@@ -245,9 +249,6 @@ func passOnCaller(ctx context.Context, req *http.Request) {
 	}
 	if c.compact != "" {
 		req.Header.Set(dshCompactHeader, c.compact)
-	}
-	if v := claudeTTLOf(c); v != "" {
-		req.Header.Set(ClaudeCacheTTLHeader, v)
 	}
 
 	if c.agent == "" {

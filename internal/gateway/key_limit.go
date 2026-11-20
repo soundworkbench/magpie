@@ -192,6 +192,9 @@ func (s *Server) keyLimit(w http.ResponseWriter, r *http.Request) {
 		if len(who.Models) > 0 {
 			out["models"] = who.Models
 		}
+		if len(who.RelayModels) > 0 {
+			out["relayModels"] = who.RelayModels
+		}
 		if who.Quotas {
 			ps := []string{}
 			for id, every := range newQuotaScope(who, provider.Catalog()).every {

@@ -314,6 +314,7 @@ func (s *Server) logSearch(ctx context.Context, rec usage.Record, query string, 
 	}
 	who := access.Caller(ctx)
 	rec.CallerKeyID, rec.CallerKeyName, rec.CallerIssuerID = who.KeyID, who.KeyName, who.IssuerID()
+	rec.Relay = relayRequestFromContext(ctx)
 	switch {
 	case err != nil && found == 0 && errors.Is(err, errFoundNothing):
 		rec.Error = "found nothing"

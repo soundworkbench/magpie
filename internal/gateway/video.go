@@ -1094,7 +1094,7 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	keyWho, keyHeld := keyHolds(r)
 	if named && (isGroup && !groupGiven(r, keyWho, keyHeld, g, ms) || keyHeld && !isGroup && !modelAllowed(keyWho, p, model)) {
-		fail(keyModelRefusal(w, keyWho, f.Model))
+		fail(keyModelRefusal(w, keyWho, f.Model, relayRequest(r)))
 		return
 	}
 	if msg, off := modelOff(p, model, f.Model); off { // disabled by the user (#1867)
@@ -1117,7 +1117,7 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		t := s.drawingTries(g, ms, keeps, servesKind(provider.KindVideo))
 		if len(t) == 0 && keeps != nil {
-			fail(keyGroupRefusal(w, keyWho, f.Model, ms))
+			fail(keyGroupRefusal(w, keyWho, f.Model, ms, relayRequest(r)))
 			return
 		}
 		if len(t) > 0 {
@@ -1398,7 +1398,7 @@ func videoModelHeld(r *http.Request, p provider.Provider, model string) string {
 	if model == "" {
 		return fmt.Sprintf("The gateway key %q may not ask after this video: %s didn't say which model makes it.", who.KeyName, p.Name)
 	}
-	return keyModelError(who, p.ID+"/"+model)
+	return keyModelError(who, p.ID+"/"+model, relayRequest(r))
 }
 
 // openAIVideo is how a video at an OpenAI-shaped videos API (another

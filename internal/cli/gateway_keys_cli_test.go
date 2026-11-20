@@ -271,6 +271,48 @@ func TestGatewayKeyModelsCLI(t *testing.T) {
 	}
 }
 
+func TestGatewayKeyRelayModelsCLI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := settings.Save(settings.Settings{LAN: true}); err != nil {
+		t.Fatal(err)
+	}
+	call := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		err := gatewayKeysTo(&out, append([]string{"gateway-key"}, args...))
+		return out.String(), err
+	}
+	if _, err := call("add", "Relay"); err != nil {
+		t.Fatal(err)
+	}
+	keys, _ := access.List()
+	id := keys[0].ID
+	if got, err := call("relay-models", id); err != nil || got != "Relay: no relay-only models\n" {
+		t.Fatal(got, err)
+	}
+	if got, err := call("relay-models", id, "claude/*"); err != nil || got != "Relay: only claude/*\n" {
+		t.Fatal(got, err)
+	}
+	if keys, _ = access.List(); !slices.Equal(keys[0].RelayModels, []string{"claude/*"}) {
+		t.Fatal(keys[0].RelayModels)
+	}
+	if got, err := call("list"); err != nil || !strings.Contains(got, "RELAY MODELS") || !strings.Contains(got, "claude/*") {
+		t.Fatalf("relay models list: %q (%v)", got, err)
+	}
+	if got, err := call("relay-models", id, "none"); err != nil || got != "Relay: no relay-only models\n" {
+		t.Fatal(got, err)
+	}
+	if _, err := call("relay-models", id, "all"); err == nil {
+		t.Fatal("all unexpectedly cleared relay models")
+	}
+	for _, args := range [][]string{{"relay-models"}, {"relay-models", id, "claude"}, {"relay-models", "missing", "claude/x"}} {
+		if _, err := call(args...); err == nil {
+			t.Error("accepted", args)
+		}
+	}
+}
+
 // magpie gateway-key accounts sets, shows and takes off a key's account
 // whitelist, and refuses an account no provider has (#905). An account's
 // stable id, named by who is signed in, is exercised against a real

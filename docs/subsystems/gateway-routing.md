@@ -11,6 +11,13 @@ This page covers how a request is routed. Plugins that change requests and
 replies are in [Gateway middleware](gateway-middleware.md). Subscriptions
 served by a plugin are in [Provider and plugin ownership](provider-plugins.md).
 
+Requests carrying `X-Magpie-Relay` are authenticated as remote requests. When
+`MAGPIE_RELAY_TOKEN_FILE` names a non-empty token file and the header matches
+it, a gateway key's `relayModels` patterns are added to its ordinary `models`
+patterns for model checks and lists. The header is removed before a request is
+forwarded, and an unconfigured or mismatched header never grants relay model
+access; any request carrying it still needs a valid gateway key.
+
 WorkBuddy and CodeBuddy Code's `X-Conversation-ID` is a native session header
 in `sessionHeaders` (`sessionOf`, `nativeSessionOf`, `conversationID` in
 [`gateway.go`](../../internal/gateway/gateway.go)). It keeps their requests
@@ -625,6 +632,40 @@ sees nor uses). Before it, a key could be held to some groups (a key's
 `TestGroupKeysListedAndSaved`, `group-keys.test.cjs`.
 
 ## Remote magpie APIs
+
+`settings.json`'s `warmWait` (`{"off":false,"seconds":30}`) keeps a
+conversation with its last answerer when affinity kept it and `cacheHolds`
+still finds a worthwhile warm cache (`Affinity.Warm`). Only a full lane or
+one with waiters qualifies; a cold cache, unavailable or spent answerer,
+previously tried account, full RPM window, reserve or Strict affinity does
+not add a wait. Zero seconds means 30, other values are clamped to 20–60.
+[`warmWaitFor` and `takeWarm`](../../internal/gateway/warm_wait.go) suppress
+`laneMate` and defer `waitMate` from lane queue entry until the window ends;
+then ordinary mate selection resumes, or the original queue continues.
+Gateway key slots, handed slots, near-cap turns, QueueLimit, QueueWait and
+cancellation retain their rules. `/v1/magpie/concurrency` reports atomic
+`warmWait` counts (`started`, `own`, `gaveWay`, `ownAfterTimeout`, `canceled`,
+`queueEnded`) and `totalMillis`/`maxMillis`; `queueEnded` means QueueWait
+ended an actual wait, not a successful acquisition or a client cancellation.
+Each completed wait logs its account, milliseconds, outcome and an eight-digit
+session hash. `Route.WarmWait` retains even a discarded try's wait;
+`Try.WarmWait` records milliseconds on a retained try. Tests: `TestWarmWait*`.
+
+`claudeCacheTTL` (`{"ttl":"1h","groups":["claude-opus-*","group/work"],
+"keys":["gateway-key-id","Team"],"exceptKeys":["excluded-key-id"]}`)
+forces `X-Magpie-Claude-Cache-TTL: 1h` only on remote-magpie requests whose
+caller TTL is absent or `default`; an explicit `5m` or `1h` is preserved.
+[`withClaudeCacheTTL`](../../internal/gateway/claude_cache_ttl.go) matches
+the requested model before routing rewrites it, using `access.ModelAllowed`'s
+case-insensitive `*` glob (including slashes). Key ids and names match
+exactly. Empty lists match all; populated groups and keys must both match,
+and exceptKeys wins. Empty or unsupported ttl disables forcing.
+`passOnCaller` sets the header only for remote providers; direct vendors
+never receive it. The concurrency endpoint's `claudeCacheTTL.forced` counts
+caller requests forced to an hour, once across retries. Both policies use
+the normal settings reader, take effect on subsequent requests without a
+restart, and sync with other settings (neither is in `KeepOwn`). Tests:
+`TestClaudeCacheTTL*` in gateway and settings.
 
 `GET /v1/magpie/load` (`provider.RemoteLoadPath`,
 [`load_guard.go`](../../internal/gateway/load_guard.go)) uses the gateway's

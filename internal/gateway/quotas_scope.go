@@ -40,6 +40,7 @@ type quotaScope struct {
 // may not be told quotas 403 (refuseHeld) and says so with ok false.
 func scopeQuotas(w http.ResponseWriter, r *http.Request) (*quotaScope, bool) {
 	who := access.Caller(r.Context())
+	who = relayModelsFor(r, who)
 	if !heldKey(who) {
 		return nil, true
 	}

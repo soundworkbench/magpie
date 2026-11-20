@@ -93,8 +93,10 @@ type lane struct {
 // nobody: to the next key, account or member, else told to the agent as a
 // 429 in its API's own shape, with Retry-After.
 //
-// A full one gives way first. Where the request has another key or
-// account of the same provider, or another member of its routing group,
+// A full one usually gives way first. A hot kept conversation gets a
+// short warmWait window to avoid rebuilding its cache on another account.
+// Otherwise, where the request has another key or account of the same
+// provider, or another member of its routing group,
 // with a slot free now and not resting, that one is asked first and the
 // full one keeps its place after it (laneMate): a group spreads its
 // requests over members with room before any waits. A fallback provider is
@@ -145,6 +147,12 @@ func (l *lanes) acquire(ctx context.Context, who string, limit int) (release fun
 // whether the request goes to another key or account instead (waitMate,
 // which takes that one's slot): true leaves the queue with errMoved.
 func (l *lanes) take(ctx context.Context, who string, limit, queue int, wait time.Duration, move func() (bool, time.Time)) (release func(), waited time.Duration, err error) {
+	return l.takeQueued(ctx, who, limit, queue, wait, move, nil)
+}
+
+// takeQueued also tells when the request joined the queue. The hook runs
+// without l.mu held, and never for a free slot or a full queue's refusal.
+func (l *lanes) takeQueued(ctx context.Context, who string, limit, queue int, wait time.Duration, move func() (bool, time.Time), queuedAt func(time.Time)) (release func(), waited time.Duration, err error) {
 	l.mu.Lock()
 	if l.m == nil {
 		l.m = map[string]*lane{}
@@ -180,6 +188,9 @@ func (l *lanes) take(ctx context.Context, who string, limit, queue int, wait tim
 	l.mu.Unlock()
 	defer notePhase(ctx, "slot")()
 	queued := time.Now()
+	if queuedAt != nil {
+		queuedAt(queued)
+	}
 	var timeout <-chan time.Time
 	if wait > 0 {
 		t := time.NewTimer(wait)
@@ -499,7 +510,7 @@ func (s *Server) concurrency(w http.ResponseWriter, r *http.Request) {
 		waiting += ln.Waiting
 	}
 	b := s.Busy()
-	writeJSON(w, 200, map[string]any{"object": "concurrency", "data": lanes, "requests": b.Requests, "keys": keys, "waiting": waiting, "tools": b.Tools, "active": s.Active()})
+	writeJSON(w, 200, map[string]any{"object": "concurrency", "data": lanes, "requests": b.Requests, "keys": keys, "waiting": waiting, "tools": b.Tools, "active": s.Active(), "warmWait": s.warmWait.snapshot(), "claudeCacheTTL": map[string]int64{"forced": s.claudeCacheForced.Load()}})
 }
 
 // Lanes is how each key or account with requests out or waiting stands,

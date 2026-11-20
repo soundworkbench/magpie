@@ -42,6 +42,7 @@ func codexPost(t *testing.T, body string) (int, string) {
 	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer chatgpt-token")
 	req.Header.Set("chatgpt-account-id", "acct-1")
+	req.Header.Set(relayHeader, "relay-secret")
 	New().Handler().ServeHTTP(rec, req)
 	return rec.Code, rec.Body.String()
 }
@@ -72,7 +73,7 @@ func TestCodexOwnModelPassesThrough(t *testing.T) {
 	if u := usage.Load(time.Time{}); len(u) != 1 || u[0].Input != 9 || u[0].Output != 2 || u[0].Provider != "openai" || u[0].ResponseID != "r1" {
 		t.Errorf("usage %+v", u)
 	}
-	if path != "/backend-api/codex/responses" || head.Get("Authorization") != "Bearer chatgpt-token" || head.Get("chatgpt-account-id") != "acct-1" {
+	if path != "/backend-api/codex/responses" || head.Get("Authorization") != "Bearer chatgpt-token" || head.Get("chatgpt-account-id") != "acct-1" || head.Get(relayHeader) != "" {
 		t.Errorf("upstream %s %v", path, head)
 	}
 	var q struct {

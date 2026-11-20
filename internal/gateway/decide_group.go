@@ -96,7 +96,7 @@ func (s *Server) serveDecisionGroup(w http.ResponseWriter, r *http.Request, body
 	// a gateway key held to some models (#882) names the group, or the
 	// models of it it may use
 	if !groupGiven(r, keyWho, keyHeld, g, ms) {
-		msg := keyModelError(keyWho, asked)
+		msg := keyModelError(keyWho, asked, relayRequest(r))
 		if groupBarred(keyWho, g) { // bound to other keys
 			msg = groupKeysError(keyWho, g)
 		}
@@ -130,7 +130,7 @@ func (s *Server) serveDecisionGroup(w http.ResponseWriter, r *http.Request, body
 		}
 		// every member left is one a spent limit of the key's counts
 		if len(cs) == 0 && keyHeld && len(members) == 0 {
-			if st, msg := keyGroupRefusal(w, keyWho, asked, ms); st == http.StatusTooManyRequests {
+			if st, msg := keyGroupRefusal(w, keyWho, asked, ms, relayRequest(r)); st == http.StatusTooManyRequests {
 				writeError(w, provider.Chat, st, msg)
 				return
 			}

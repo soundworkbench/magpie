@@ -87,6 +87,43 @@ func TestIssueKeyRefusesBadTTL(t *testing.T) {
 	}
 }
 
+func TestIssuedRelayModelsUseIssuerModelsAndSurviveRelayClear(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	pid, _ := addKey(t, "Orchestrator")
+	if _, err := Update("models-key", Change{Key: pid, Models: []string{"openai/*"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Update("relay-models-key", Change{Key: pid, RelayModels: []string{"claude/*"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Update("issuer-key", Change{Key: pid, Issues: true}); err != nil {
+		t.Fatal(err)
+	}
+	child, err := IssueKey(Issue{TTL: time.Hour, Issuer: pid, RelayModels: []string{"openai/gpt-5"}})
+	if err != nil {
+		t.Fatalf("issuer's ordinary models should cover relay models: %v", err)
+	}
+	if who, ok := Authenticate(child.Key); !ok || !slices.Equal(who.RelayModels, []string{"openai/gpt-5"}) {
+		t.Fatalf("child relay models: %+v, ok=%v", who, ok)
+	}
+	inherited, err := IssueKey(Issue{TTL: time.Hour, Issuer: pid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if who, ok := Authenticate(inherited.Key); !ok || !slices.Equal(who.RelayModels, []string{"claude/*"}) {
+		t.Fatalf("inherited relay models: %+v, ok=%v", who, ok)
+	}
+	if _, err := Update("relay-models-key", Change{Key: pid}); err != nil {
+		t.Fatal(err)
+	}
+	if who, ok := Authenticate(child.Key); !ok || len(who.RelayModels) != 0 || !slices.Equal(who.Models, []string{"openai/*"}) {
+		t.Fatalf("clearing issuer relay models refused or changed child: %+v, ok=%v", who, ok)
+	}
+	if who, ok := Authenticate(inherited.Key); !ok || len(who.RelayModels) != 0 {
+		t.Fatalf("clearing issuer relay models refused inherited child: %+v, ok=%v", who, ok)
+	}
+}
+
 // Never let an issued key outlive or exceed its issuer.
 func TestIssuedKeyBoundedByIssuer(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())

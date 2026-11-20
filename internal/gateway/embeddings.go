@@ -135,7 +135,7 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 	}
 	keyWho, keyHeld := keyHolds(r)
 	if isGroup && !groupGiven(r, keyWho, keyHeld, g, ms) || keyHeld && !isGroup && !modelAllowed(keyWho, p, model) {
-		st, msg := keyModelRefusal(w, keyWho, asked)
+		st, msg := keyModelRefusal(w, keyWho, asked, relayRequest(r))
 		call.Status, call.Error = st, msg
 		writeError(w, provider.Chat, st, msg)
 		s.record(call)
@@ -191,7 +191,7 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 		keeps := groupKeeps(keyWho, g, ms)
 		tries = slices.DeleteFunc(tries, func(c candidate) bool { return !keeps[c.p.ID+"/"+c.model] })
 		if len(tries) == 0 {
-			st, msg := keyGroupRefusal(w, keyWho, asked, ms)
+			st, msg := keyGroupRefusal(w, keyWho, asked, ms, relayRequest(r))
 			call.Status, call.Error = st, msg
 			writeError(w, provider.Chat, st, msg)
 			s.record(call)

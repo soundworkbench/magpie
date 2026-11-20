@@ -89,6 +89,39 @@ func TestKeyModelsKept(t *testing.T) {
 	}
 }
 
+func TestKeyRelayModelsKeptAlongsideOtherFields(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	secret, err := Update("add-key", Change{Name: "Relay"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, _ := List()
+	id := keys[0].ID
+	if _, err := Update("models-key", Change{Key: id, Models: []string{"codex/*"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Update("relay-models-key", Change{Key: id, RelayModels: []string{"claude/*"}}); err != nil {
+		t.Fatal(err)
+	}
+	who, ok := Authenticate(secret)
+	if !ok || !slices.Equal(who.Models, []string{"codex/*"}) || !slices.Equal(who.RelayModels, []string{"claude/*"}) || !ModelAllowed(who.RelayModels, "claude/x") || ModelAllowed(who.RelayModels, "openai/x") {
+		t.Fatalf("identity %+v, ok=%v", who, ok)
+	}
+	b, err := os.ReadFile(Path())
+	if err != nil || !strings.Contains(string(b), `"relayModels"`) || !strings.Contains(string(b), `"models"`) {
+		t.Fatalf("caller-keys.json: %s (%v)", b, err)
+	}
+	if _, err := Update("relay-models-key", Change{Key: id, RelayModels: []string{"none"}}); err == nil {
+		t.Fatal("accepted none as a model pattern")
+	}
+	if _, err := Update("relay-models-key", Change{Key: id}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := Authenticate(secret); len(got.RelayModels) != 0 || !slices.Equal(got.Models, []string{"codex/*"}) {
+		t.Fatalf("clearing relay models changed ordinary models: %+v", got)
+	}
+}
+
 // A pattern's expression is compiled once and kept (#1762): each pattern
 // keeps its own, asked in turn and again, and past the cap as before.
 func TestModelPatternsKeptCompiled(t *testing.T) {

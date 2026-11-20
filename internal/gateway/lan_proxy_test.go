@@ -1,14 +1,174 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/usage"
 )
+
+func TestRelayHeaderNeedsKeyAndIsRemoved(t *testing.T) {
+	fresh(t)
+	path := filepath.Join(t.TempDir(), "relay-token")
+	if err := os.WriteFile(path, []byte(" relay-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_RELAY_TOKEN_FILE", path)
+	s := settings.Load()
+	s.LAN = true
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	seen := ""
+	h := lanGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Get("X-Magpie-Relay") + "|" + strconv.FormatBool(relayRequest(r))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	call := func(secret, relay string) int {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.RemoteAddr = "127.0.0.1:51234"
+		r.Header.Set("X-Forwarded-For", "10.0.0.2")
+		r.Header.Set("X-Magpie-Relay", relay)
+		if secret != "" {
+			r.Header.Set("Authorization", "Bearer "+secret)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	if c := call("", "relay-secret"); c != http.StatusUnauthorized {
+		t.Fatal("valid relay without key", c)
+	}
+	if c := call("", "wrong"); c != http.StatusUnauthorized {
+		t.Fatal("invalid relay without key", c)
+	}
+	_, secrets := newCaller(t, "Relay client")
+	if c := call("sk-magpie-invalid", "relay-secret"); c != http.StatusUnauthorized {
+		t.Fatal("invalid key with relay", c)
+	}
+	if c := call(secrets[0], "relay-secret"); c != http.StatusNoContent || seen != "|true" {
+		t.Fatalf("relay with key: %d, seen %q", c, seen)
+	}
+	if c := call(secrets[0], "wrong"); c != http.StatusNoContent || seen != "|false" {
+		t.Fatalf("ordinary request with wrong relay token: %d, seen %q", c, seen)
+	}
+}
+
+func TestRelayHeaderDoesNotBypassUnsharedGateway(t *testing.T) {
+	fresh(t)
+	_, secrets := newCaller(t, "Relay client")
+	s := settings.Load()
+	s.LAN = false
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	h := lanGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	call := func(relay bool) (int, string) {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.RemoteAddr = "127.0.0.1:51234"
+		r.Header.Set("Cf-Connecting-IP", "203.0.113.9")
+		r.Header.Set("Authorization", "Bearer "+secrets[0])
+		if relay {
+			r.Header.Set(relayHeader, "anything")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code, w.Body.String()
+	}
+	plainCode, plainBody := call(false)
+	relayCode, relayBody := call(true)
+	if plainCode != http.StatusForbidden || relayCode != plainCode || relayBody != plainBody {
+		t.Fatalf("relay changed unshared response: plain %d %q, relay %d %q", plainCode, plainBody, relayCode, relayBody)
+	}
+}
+
+func TestUsageMarksRelayRequests(t *testing.T) {
+	fresh(t)
+	path := filepath.Join(t.TempDir(), "relay-token")
+	if err := os.WriteFile(path, []byte("relay-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_RELAY_TOKEN_FILE", path)
+	_, secrets := newCaller(t, "Relay")
+	h := lanGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		appendUsage(r, usage.Record{Time: time.Now(), Agent: "test", Provider: "fake", Model: "m", Status: 200})
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	call := func(relay bool) {
+		r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		r.RemoteAddr = "127.0.0.1:51234"
+		r.Header.Set("X-Forwarded-For", "10.0.0.2")
+		r.Header.Set("Authorization", "Bearer "+secrets[0])
+		if relay {
+			r.Header.Set(relayHeader, "relay-secret")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("request: %d %s", w.Code, w.Body.String())
+		}
+	}
+	call(true)
+	call(false)
+	recs := usage.Load(time.Time{})
+	if len(recs) != 2 || !recs[0].Relay || recs[1].Relay {
+		t.Fatalf("relay usage flags: %+v", recs)
+	}
+}
+
+func TestSearchUsageMarksRelayRequests(t *testing.T) {
+	fresh(t)
+	ctx := context.WithValue(context.Background(), relayRequestKey{}, true)
+	now := time.Now()
+	logNativeSearches(ctx, 1, now, "test", "fake", "fake.test", "m")
+	New().logSearch(ctx, usage.Record{Provider: "fake", Model: "m"}, "", now, 1, nil)
+	logNativeSearches(context.Background(), 1, now, "test", "fake", "fake.test", "m")
+	raw, err := os.ReadFile(usage.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recs []usage.Record
+	for _, line := range bytes.Split(raw, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec usage.Record
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, rec)
+	}
+	if len(recs) != 3 {
+		t.Fatalf("search usage records: %+v", recs)
+	}
+	var relay, ordinary int
+	for _, rec := range recs {
+		if rec.Source != usage.SourceSearch || rec.Kind != "web_search" {
+			t.Fatalf("unexpected search usage record: %+v", rec)
+		}
+		if rec.Relay {
+			relay++
+		} else {
+			ordinary++
+		}
+	}
+	if relay != 2 || ordinary != 1 {
+		t.Fatalf("search relay usage flags: %+v", recs)
+	}
+}
 
 // A tunnel or proxy on this computer (cloudflared, ngrok, Tailscale serve,
 // frp, Caddy) reaches the gateway on loopback for clients anywhere (#1022).
