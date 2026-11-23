@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // keyedSlow is slow to start on one key's one model while slow is set,
@@ -179,6 +181,36 @@ func TestCanceledSlowStartRestsNothing(t *testing.T) {
 	defer routed.Unlock()
 	if len(routed.slow) != 0 {
 		t.Fatalf("counted: %v", routed.slow)
+	}
+}
+
+func TestSlowCooldownSaturatesAtRestCap(t *testing.T) {
+	fresh(t)
+	st := settings.Load()
+	st.SlowRests = 1
+	st.SlowCooldown = math.MaxInt
+	if err := settings.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	c := candidate{
+		p:     provider.Provider{ID: "a", Key: "k", RestCap: 20},
+		model: "m",
+		rest:  "a#" + provider.KeyID("k"),
+	}
+	now := time.Now()
+	if _, ok := restSlow(c, now); !ok {
+		t.Fatal("first slow start did not rest")
+	}
+	secondNow := now.Add(time.Second)
+	restingUntil.Lock()
+	restingUntil.m[c.restID()] = secondNow.Add(-time.Second)
+	restingUntil.Unlock()
+	r, ok := restSlow(c, secondNow)
+	if !ok {
+		t.Fatal("second slow start did not rest")
+	}
+	if d := r.Until.Sub(secondNow); d != 20*time.Minute || !r.Until.After(secondNow) {
+		t.Fatalf("saturated rest %s, until %v; want positive 20m", d, r.Until)
 	}
 }
 

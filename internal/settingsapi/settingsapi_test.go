@@ -291,12 +291,28 @@ func TestWarmWaitAndClaudeCacheTTLKept(t *testing.T) {
 		Keys:       []string{"team-key"},
 		ExceptKeys: []string{"except-key"},
 	}
+	cur.SlowForget, cur.SlowRests, cur.SlowCooldown = 600, 3, 900
 	in, err := Merge([]byte(`{"theme":"dark"}`), cur, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if in.WarmWait != cur.WarmWait || !reflect.DeepEqual(in.ClaudeCacheTTL, cur.ClaudeCacheTTL) {
 		t.Fatalf("page save changed settings.json-only values: warm wait %+v, cache TTL %+v", in.WarmWait, in.ClaudeCacheTTL)
+	}
+	if in.SlowForget != cur.SlowForget || in.SlowRests != cur.SlowRests || in.SlowCooldown != cur.SlowCooldown {
+		t.Fatalf("page save changed slow-start settings: %+v", in)
+	}
+}
+
+func TestSlowRestSettingsKeptWhenPageOmitsThem(t *testing.T) {
+	cur := settings.Defaults()
+	cur.SlowForget, cur.SlowRests, cur.SlowCooldown = 600, 3, 900
+	in, err := Merge([]byte(`{"theme":"dark"}`), cur, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.SlowForget != 600 || in.SlowRests != 3 || in.SlowCooldown != 900 {
+		t.Fatalf("page save changed slow-start settings: %+v", in)
 	}
 }
 
