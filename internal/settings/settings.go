@@ -420,6 +420,14 @@ type Settings struct {
 	// These routing policies travel with the normal settings sync.
 	WarmWait       WarmWaitConfig       `json:"warmWait,omitzero"`
 	ClaudeCacheTTL ClaudeCacheTTLConfig `json:"claudeCacheTTL,omitzero"`
+	// These slow-start rest settings are in settings.json; the Settings page
+	// carries them through without editing them. SlowForget is the seconds a
+	// model's consecutive slow starts are kept;
+	// SlowRests is the slow start number that begins a rest; SlowCooldown is
+	// the first rest's seconds. Non-positive values use the defaults.
+	SlowForget   int `json:"slowForget,omitempty"`
+	SlowRests    int `json:"slowRests,omitempty"`
+	SlowCooldown int `json:"slowCooldown,omitempty"`
 	// RefusalRetries is how many more times a request the vendor's safety
 	// filter refused, with nothing said, is asked of another account or
 	// routing group member (#248), unset for every one left. 0 hands the

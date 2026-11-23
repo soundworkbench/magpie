@@ -1856,6 +1856,18 @@ magpie group rm opus-anywhere           # one magpie found is hidden; magpie gro
 magpie claude group/opus-anywhere       # use it
 ```
 
+For a group whose `groupFirstToken` setting gives a member a first-token
+deadline, three global routing settings control when repeatedly slow members
+rest. `slowForget` is the consecutive-slow-start window in seconds (default
+`1800`, 30 minutes), `slowRests` is the slow-start number that begins a rest
+(default `2`), and `slowCooldown` is the first rest in seconds (default `60`,
+one minute). Actual rests never exceed the provider's rest cap (10 minutes by
+default); raise that cap too when a longer rest is wanted. Later rests double
+as before. Non-positive values use these defaults. For example,
+`{"slowForget":600,"slowRests":3,"slowCooldown":900}` rests a member after
+three slow starts in ten minutes for 15 minutes, then doubles subsequent
+rests.
+
 `routing=` is `smart` (the default: of the subscriptions with quota to
 spare, the one whose allowance renews soonest first), `order` (the first
 model until it can't answer, then the next), `rotate` (each turn to the next

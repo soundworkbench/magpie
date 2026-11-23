@@ -283,20 +283,22 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	settings.CarryPerModel(&in, &cur)
 	in.LAN, in.LANKey = cur.LAN, cur.LANKey
 	in.LANKeyID = cur.LANKeyID
-	in.Port = cur.Port                                 // set on its own (port), which moves the gateway
-	in.CORSOrigins = cur.CORSOrigins                   // set on its own (cors)
-	in.AllowIPs = cur.AllowIPs                         // set on its own (allowips)
-	in.FetchPrivate = cur.FetchPrivate                 // in settings.json only
-	in.RouterNote = cur.RouterNote                     // set on its own (the Library's servers/hub-note)
-	in.RouterAllTools = cur.RouterAllTools             // set on its own (the Library's servers/hub-tools)
-	in.GitHubToken = cur.GitHubToken                   // set on its own (github-token), never sent to the page
-	in.ProxyCustom = cur.ProxyCustom                   // set by settings.Save from the proxy, never by the page
-	in.RequestArchive = cur.RequestArchive             // the Gateway page's, set on its own
-	in.RequestArchiveMaxMB = cur.RequestArchiveMaxMB   // in settings.json only
-	in.LoadGuard = cur.LoadGuard                       // this machine's settings.json
-	in.ClaudeRunsMost = cur.ClaudeRunsMost             // magpie claude-code runs, or settings.json (#2956)
-	in.WarmWait = cur.WarmWait                         // settings.json only
-	in.ClaudeCacheTTL = cur.ClaudeCacheTTL             // settings.json only
+	in.Port = cur.Port                               // set on its own (port), which moves the gateway
+	in.CORSOrigins = cur.CORSOrigins                 // set on its own (cors)
+	in.AllowIPs = cur.AllowIPs                       // set on its own (allowips)
+	in.FetchPrivate = cur.FetchPrivate               // in settings.json only
+	in.RouterNote = cur.RouterNote                   // set on its own (the Library's servers/hub-note)
+	in.RouterAllTools = cur.RouterAllTools           // set on its own (the Library's servers/hub-tools)
+	in.GitHubToken = cur.GitHubToken                 // set on its own (github-token), never sent to the page
+	in.ProxyCustom = cur.ProxyCustom                 // set by settings.Save from the proxy, never by the page
+	in.RequestArchive = cur.RequestArchive           // the Gateway page's, set on its own
+	in.RequestArchiveMaxMB = cur.RequestArchiveMaxMB // in settings.json only
+	in.LoadGuard = cur.LoadGuard                     // this machine's settings.json
+	in.ClaudeRunsMost = cur.ClaudeRunsMost           // magpie claude-code runs, or settings.json (#2956)
+	in.WarmWait = cur.WarmWait                       // settings.json only
+	in.ClaudeCacheTTL = cur.ClaudeCacheTTL           // settings.json only
+	// The slow-start rest policy is settings.json-only as well.
+	in.SlowForget, in.SlowRests, in.SlowCooldown = cur.SlowForget, cur.SlowRests, cur.SlowCooldown
 	in.GatewayConversations = cur.GatewayConversations // Sessions' explicit recording consent
 	in.RedactRules = cur.RedactRules                   // the masking rules, set on their own
 	in.RedactModel = cur.RedactModel                   // set on its own (privacy-model)
