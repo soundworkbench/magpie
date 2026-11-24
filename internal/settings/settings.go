@@ -430,11 +430,17 @@ type Settings struct {
 	SlowCooldown int `json:"slowCooldown,omitempty"`
 	// RefusalRetries is how many more times a request the vendor's safety
 	// filter refused, with nothing said, is asked of another account or
-	// routing group member (#248), unset for every one left. 0 hands the
-	// refusal straight back: to an agent on Anthropic's Messages API as
-	// the vendor's own reply, stop_reason "refusal", which Claude Code
-	// answers by switching to its fallback model itself (DD on Discord).
+	// routing group member when NoRefusalHandover is false (#248), unset for
+	// every one left. 0 hands the refusal straight back: to an agent on
+	// Anthropic's Messages API as the vendor's own reply, stop_reason
+	// "refusal", which Claude Code answers by switching to its fallback model
+	// itself (DD on Discord).
 	RefusalRetries *int `json:"refusalRetries,omitempty"`
+	// NoRefusalHandover keeps a safety-filter refusal on the account that
+	// answered it, without handing the request to another account or group
+	// member. It defaults on when omitted; false restores refusalHandover's
+	// previous behavior. A pointer distinguishes that default from false.
+	NoRefusalHandover *bool `json:"noRefusalHandover,omitempty"`
 	// RetryAfterCap is the longest Retry-After, in seconds, an agent is
 	// told (#5371, tlerbao): a plan's quota running out rests its account
 	// until the plan's reset, hours away, and an agent with a fallback

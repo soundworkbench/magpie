@@ -2529,6 +2529,9 @@ type holdWriter struct {
 	// through as it comes. A refusal isn't a failure of the account, so
 	// nobody rests for it, whatever its timing (#248)
 	refusedAfter bool
+	// refusedAfterMsg is retained when refusal handover keeps that refusal on
+	// this stream, so the usage row still records the vendor's reason.
+	refusedAfterMsg string
 	// calls: a tool call of some kind has gone by in the reply, so a
 	// refusal after it is not handed over (handsOff): the call the agent
 	// has would sit beside the next member's, broken or doubled
@@ -3345,6 +3348,9 @@ func (h *holdWriter) refusalAfter(b []byte) {
 		if mayRefuse(ev) {
 			if kind, status, msg := streamEvent(ev); kind == eventRefusal || kind == eventRefusalError {
 				h.refusedAfter = true
+				if !refusalAsksAgain(h.overRefusals() + 1) {
+					h.refusedAfterMsg = msg
+				}
 				// an error event mid-reply is a stream's accident, kept as
 				// it came (#733); the finish code is the vendor's word that
 				// the turn it had begun was never answered (#5075)
@@ -3369,6 +3375,13 @@ func (h *holdWriter) refusalAfter(b []byte) {
 		return
 	}
 	h.after = append([]byte(nil), buf...)
+}
+
+func (h *holdWriter) overRefusals() int {
+	if h.over == nil {
+		return 0
+	}
+	return h.over.refusals
 }
 
 // mayCall says whether a write of the reply carries a tool call of some
@@ -3543,11 +3556,15 @@ func (h *holdWriter) handBack() bool {
 }
 
 // refusalAsksAgain says whether a request refused n times by the vendor's
-// safety filter is asked of the next account or member left: as many
-// times as Settings' RefusalRetries says, every one left when it is unset
-// (#248).
+// safety filter is asked of the next account or member left. The
+// noRefusalHandover setting is the default guard; when it is off,
+// RefusalRetries retains the old count (every one left when unset, #248).
 func refusalAsksAgain(n int) bool {
-	retries := settings.Load().RefusalRetries
+	s := settings.Load()
+	if s.NoRefusalHandover == nil || *s.NoRefusalHandover {
+		return false
+	}
+	retries := s.RefusalRetries
 	return retries == nil || *retries < 0 || n <= *retries
 }
 

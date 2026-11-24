@@ -27,6 +27,8 @@ var (
 func refusalRetries(t *testing.T, n int) {
 	t.Helper()
 	s := settings.Load()
+	handover := false
+	s.NoRefusalHandover = &handover
 	s.RefusalRetries = &n
 	if err := settings.Save(s); err != nil {
 		t.Fatal(err)
@@ -102,9 +104,9 @@ func TestRefusalRetriesNoneHandsClaudeCodeTheRefusal(t *testing.T) {
 	}
 }
 
-// RefusalRetries counts the tries after the first refusal: at 1, two keys
-// of three are asked; unset, as by default, every one is (#248), and the
-// one that answers is what the agent gets.
+// With refusal handover enabled, RefusalRetries counts the tries after the
+// first refusal: at 1, two keys of three are asked; unset, every one is
+// (#248), and the one that answers is what the agent gets.
 func TestRefusalRetriesCountsTheTries(t *testing.T) {
 	fresh(t)
 	refusalRetries(t, 1)
@@ -115,6 +117,7 @@ func TestRefusalRetriesCountsTheTries(t *testing.T) {
 	}
 
 	fresh(t)
+	refusalHandoverOff(t)
 	keys = keyedClaude(t, "k1", "k2")
 	code, body = sendTo(New(), "/v1/messages", messagesAsk)
 	if code != 200 || !strings.Contains(body, "from b") || strings.Join(*keys, ",") != "k1,k2,k3" {
@@ -123,6 +126,7 @@ func TestRefusalRetriesCountsTheTries(t *testing.T) {
 
 	// nobody left by default either: the vendor's refusal, every key asked
 	fresh(t)
+	refusalHandoverOff(t)
 	keys = keyedClaude(t, "k1", "k2", "k3")
 	code, body = sendTo(New(), "/v1/messages", messagesAsk)
 	if !handedBack(code, body) || strings.Join(*keys, ",") != "k1,k2,k3" {

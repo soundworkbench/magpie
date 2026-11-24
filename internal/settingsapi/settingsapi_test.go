@@ -220,6 +220,21 @@ func TestBodySetsOneKeyOnly(t *testing.T) {
 	}
 }
 
+func TestNoRefusalHandoverKeptAcrossPageSave(t *testing.T) {
+	home(t)
+	off := false
+	if err := settings.Save(settings.Settings{NoRefusalHandover: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Apply([]byte(`{"theme":"dark"}`), false); err != nil {
+		t.Fatal(err)
+	}
+	got := settings.Load().NoRefusalHandover
+	if got == nil || *got {
+		t.Fatalf("noRefusalHandover after another settings page save = %v, want false", got)
+	}
+}
+
 // A value the save refuses writes nothing, whichever way it came in.
 func TestRefusedValueWritesNothing(t *testing.T) {
 	home(t)

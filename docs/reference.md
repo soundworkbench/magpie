@@ -2194,15 +2194,21 @@ it as above.
 
 **When the safety filter refuses.** A reply the vendor's safety filter
 refuses before any of it is said rests nobody: it is about what was asked,
-not the account. By default the same request is asked of the model's other
-accounts, then the routing group's other members, until one answers.
-Settings › Models › Routing › *Ask again after a refusal* sets how many more
-are asked: 1, 2 or 3, or *Never ask again*. When nobody else is asked, an
-agent on Anthropic's Messages API (Claude Code) gets the refusal as the
-vendor said it, `stop_reason` `refusal` with its category, which Claude Code
-answers by switching to its own fallback model, as it does on Anthropic's
-API. Codex and Chat clients get a 400 saying the model refused the request,
-which they don't ask again for. Any other 400 is never asked again.
+not the account. By default the refusal is returned immediately, without
+asking another account or routing-group member. The `noRefusalHandover`
+setting in `settings.json` is on when omitted; set it to `false` to restore
+the old `refusalHandover` behavior. With that switch off, the same request
+is asked of the model's other accounts, then the routing group's other
+members, until one answers. `refusalRetries` limits those additional tries
+when it is set (unset asks every member). With the switch on, a refusal in a
+stream after output has begun ends that stream; with it off, the older Chat
+stream handover remains available.
+When nobody else is asked, an agent on Anthropic's Messages API (Claude Code)
+gets the refusal as the vendor said it, `stop_reason` `refusal` with its
+category, which Claude Code answers by switching to its own fallback model,
+as it does on Anthropic's API. Codex and Chat clients get a 400 saying the
+model refused the request, which they don't ask again for. Any other 400 is
+never asked again.
 
 **Through the gateway, or on its own.** Everything above is the gateway's,
 for requests sent through magpie. Claude Code or Codex used on its own
