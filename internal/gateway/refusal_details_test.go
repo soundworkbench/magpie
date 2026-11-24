@@ -54,6 +54,7 @@ func TestRefusalKeepsStopDetails(t *testing.T) {
 // next key answered (#1768: a refusal followed by a fallback was hidden).
 func TestRefusalCategoryOnTheTry(t *testing.T) {
 	fresh(t)
+	refusalHandoverOff(t)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")

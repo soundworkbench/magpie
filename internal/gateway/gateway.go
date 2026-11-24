@@ -3585,11 +3585,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		if !last && c.claudeAccount() && slices.ContainsFunc(cands[i+1:], candidate.claudeAccount) {
 			retell, noRetell = tooBigToRetell(from, body)
 		}
-		if !pass && handsOver(streams, last || noRetell && len(otherThanClaudeAccounts(cands[i+1:])) == 0, wantWhole, from, refusals) {
+		if !pass && handsOver(streams, last || noRetell && len(otherThanClaudeAccounts(cands[i+1:])) == 0, wantWhole, from) {
 			// reasoning that went through as it came, and a refusal after
 			// it with nothing yet said: the next candidate answers in the
 			// same stream (refusalHandover; yhwangl on X)
-			hw.over = &refusalHandover{proto: from, seq: -1}
+			hw.over = &refusalHandover{proto: from, refusals: refusals, seq: -1}
 		}
 		// the reasoning's hold, above, once the handover is known
 		hw.thinkingShown = !s.holdsThinking(c, hw.over != nil) || last
@@ -4191,6 +4191,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		if hw.refused {
 			// the vendor's safety filter, with nothing said (#248)
 			call.Error = refusedError(c.p, c.model, hw.failMsg)
+		} else if hw.refusedAfterMsg != "" {
+			// A refusal after output stays on this stream when the setting is
+			// on; retain its reason in the try and usage row.
+			call.Error = refusedError(c.p, c.model, hw.refusedAfterMsg)
 		}
 		if hw.looped != "" {
 			// ended for looping (#1359): the agent had its 200 and the
@@ -5273,8 +5277,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// row that trusts the member's reasoning as it comes
 			// (holdsThinking, #4512); one whose filter's content_filter
 			// ended it with nothing said takes the trust back (plugins #540)
-			if hw.refusedAfter {
+			if hw.refused || hw.refusedAfter {
 				s.thoughtRefused(c)
+				try.Fail = failRefused
 			} else if hw.sawThinking() && call.Usage.Output > 0 {
 				s.thoughtAnswered(c)
 			}
@@ -5422,7 +5427,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 }
 
 // refusedError is what the agent is told of a refusal by the vendor's
-// safety filter, with nothing said before it (#248).
+// safety filter, preserving the vendor's reason (#248).
 func refusedError(p provider.Provider, model, why string) string {
 	return fmt.Sprintf("%s refused this request (%s) via %s", model, why, p.Name)
 }

@@ -16,20 +16,21 @@ import (
 // refusalHandover is a try's stream let through on its reasoning, or on what
 // only frames a reply, while another candidate stands behind it: the
 // vendor's safety filter may still refuse it before a word of the answer
-// is said, and the refusal then goes to the next candidate, whose stream
-// follows in the same response, as one refused with nothing sent does
-// (#248). Before, the agent had the reasoning, then the refusal, and the
-// next candidate was never asked: GLM's thinking shown as it came, then
-// its filter's stop, and the turn ended with nothing (yhwangl on X).
+// is said. When refusal handover is enabled, that refusal goes to the next
+// candidate, whose stream follows in the same response, as one refused with
+// nothing sent does (#248). Before, the agent had the reasoning, then the
+// refusal, and the next candidate was never asked: GLM's thinking shown as it
+// came, then its filter's stop, and the turn ended with nothing (yhwangl on X).
 //
 // What went through is read event by event to know where the next
 // stream's events go: an Anthropic stream's content blocks, a Responses
 // stream's output items and sequence numbers. Once an answer's text or a
 // call begins (spoke), a refusal is the agent's, as before (refusalAfter).
 type refusalHandover struct {
-	proto   provider.Protocol
-	pending []byte // an event not yet whole
-	spoke   bool   // the answer began: nothing is handed over any more
+	proto    provider.Protocol
+	refusals int    // safety refusals already handed to the routing loop
+	pending  []byte // an event not yet whole
+	spoke    bool   // the answer began: nothing is handed over any more
 
 	blocks int          // Anthropic: content blocks begun
 	open   map[int]bool // Anthropic: begun, not yet stopped
@@ -41,15 +42,13 @@ type refusalHandover struct {
 // the next candidate.
 var errHandedOver = errors.New("refused: handed to the next candidate")
 
-// handsOver says whether a try's refusal after its reasoning went through
-// may go to the next candidate in the same stream: the agent asked for a
-// stream in a protocol whose events can be joined (spliceAfter), another
-// candidate is left, and a refusal is asked again (refusalAsksAgain). A
-// reply wanted whole is held to its end anyway (wantWhole). A Gemini
-// stream is not joined: its chunks carry no index to move and nothing
-// says where one reply ends and the next begins.
-func handsOver(streams, last, wantWhole bool, from provider.Protocol, refusals int) bool {
-	if !streams || last || wantWhole || !refusalAsksAgain(refusals+1) {
+// handsOver says whether a try's stream may be joined to the next candidate:
+// the agent asked for a stream in a protocol whose events can be joined
+// (spliceAfter), another candidate is left, and the reply is not wanted
+// whole. Safety refusals are gated in passOver and handsOff; retryable stream
+// errors must still be handed over even when noRefusalHandover is on.
+func handsOver(streams, last, wantWhole bool, from provider.Protocol) bool {
+	if !streams || last || wantWhole {
 		return false
 	}
 	return from == provider.Chat || from == provider.Anthropic || from == provider.Responses
@@ -63,7 +62,7 @@ func (h *holdWriter) overActive() bool {
 
 // passOver writes what a passing try said while nothing of its answer
 // has been: its reasoning and frames go as they come, an event at a time,
-// and a refusal among them is handed over (handOver), not sent. An SSE
+// and a refusal among them is handed over (handOver) when enabled, not sent. An SSE
 // comment goes at once. Once the answer begins, the rest goes as it comes
 // and is read for a refusal as any reply that has begun is.
 func (h *holdWriter) passOver(b []byte) {
@@ -91,6 +90,12 @@ func (h *holdWriter) passOver(b []byte) {
 		ev := p[:end]
 		switch kind, status, msg := streamEvent(ev); kind {
 		case eventRefusal, eventRefusalError:
+			if !refusalAsksAgain(o.refusals + 1) {
+				// The setting only suppresses safety refusal handover. Keep
+				// ordinary retryable event errors on the handover path below.
+				o.spoke = true
+				break
+			}
 			o.pending = nil
 			h.handOver(status, msg, true)
 			return
@@ -146,7 +151,7 @@ func (h *holdWriter) out(b []byte) {
 // has gone by untracked would number the next one's blocks wrong; its
 // refusal goes as it came, as before.
 func (h *holdWriter) handsOff() bool {
-	return h.passing && h.over != nil && h.over.proto == provider.Chat && !h.calls
+	return h.passing && h.over != nil && h.over.proto == provider.Chat && !h.calls && refusalAsksAgain(h.over.refusals+1)
 }
 
 // handOffAfter ends a passing try at the vendor's finish code saying the

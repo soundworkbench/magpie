@@ -27,6 +27,7 @@ const bioPolicy = `{"error":{"type":"invalid_request_error","code":"bio_policy",
 // the accounts asked.
 func chatgptRefusing(t *testing.T, tried *[]string, refuse func(w http.ResponseWriter), also ...string) {
 	t.Helper()
+	refusalHandoverOff(t)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
 		acct := r.Header.Get("chatgpt-account-id")
@@ -184,6 +185,7 @@ func TestPolicyRefusalMovesToNextGroupMember(t *testing.T) {
 // said, is answered by the second, both tries on the Routing page.
 func TestClaudeRefusalMovesToNextKey(t *testing.T) {
 	fresh(t)
+	refusalHandoverOff(t)
 	var keys []string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
@@ -299,6 +301,7 @@ done
 // streamed to Codex and to an Anthropic client, and not streamed.
 func TestClaudeSubscriptionRefusalMovesToNextAccount(t *testing.T) {
 	log := claudeSubscriptionRefusing(t)
+	refusalHandoverOff(t)
 	s := New()
 	for _, ask := range []struct{ path, body string }{
 		{"/v1/responses", `{"model":"claude/claude-sonnet-5","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},

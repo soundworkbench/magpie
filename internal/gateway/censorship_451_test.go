@@ -24,6 +24,7 @@ func TestCensorshipBlocked451FailsOver(t *testing.T) {
 	} {
 		t.Run(ask.name, func(t *testing.T) {
 			fresh(t)
+			refusalHandoverOff(t)
 			a := &scripted{replies: []reply{{451, "", blocked}}}
 			b := &scripted{replies: []reply{{200, "", chatOK}}}
 			scriptedOn(t, "a", provider.Chat, a)

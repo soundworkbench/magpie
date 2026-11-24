@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -44,7 +45,20 @@ var responsesFiltered = sse(`event: response.created`+"\n"+`data: {"type":"respo
 
 func refusalGroup(t *testing.T, members ...string) {
 	t.Helper()
+	refusalHandoverOff(t)
 	if err := provider.SaveGroup(provider.Group{Name: "G", Members: members, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// refusalHandoverOff opts these legacy fallback fixtures into the behavior
+// they were written to exercise. Production defaults keep the refusal put.
+func refusalHandoverOff(t *testing.T) {
+	t.Helper()
+	n := false
+	s := settings.Load()
+	s.NoRefusalHandover = &n
+	if err := settings.Save(s); err != nil {
 		t.Fatal(err)
 	}
 }

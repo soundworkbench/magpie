@@ -297,6 +297,7 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.ClaudeRunsMost = cur.ClaudeRunsMost           // magpie claude-code runs, or settings.json (#2956)
 	in.WarmWait = cur.WarmWait                       // settings.json only
 	in.ClaudeCacheTTL = cur.ClaudeCacheTTL           // settings.json only
+	in.NoRefusalHandover = cur.NoRefusalHandover     // settings.json only
 	// The slow-start rest policy is settings.json-only as well.
 	in.SlowForget, in.SlowRests, in.SlowCooldown = cur.SlowForget, cur.SlowRests, cur.SlowCooldown
 	in.GatewayConversations = cur.GatewayConversations // Sessions' explicit recording consent

@@ -536,3 +536,34 @@ func TestDefaultTextSize(t *testing.T) {
 		t.Fatalf("on %s the default is %d, want %d", runtime.GOOS, orig(), want)
 	}
 }
+
+func TestNoRefusalHandoverDefaultsOnAndPersistsFalse(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if got := Load().NoRefusalHandover; got != nil {
+		t.Fatalf("omitted noRefusalHandover = %v, want the default-on nil value", *got)
+	}
+	off := false
+	if err := Save(Settings{NoRefusalHandover: &off}); err != nil {
+		t.Fatal(err)
+	}
+	got := Load().NoRefusalHandover
+	if got == nil || *got {
+		t.Fatalf("saved noRefusalHandover = %v, want false", got)
+	}
+	b, err := os.ReadFile(Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file map[string]json.RawMessage
+	if err := json.Unmarshal(b, &file); err != nil {
+		t.Fatalf("settings.json is not JSON: %v", err)
+	}
+	raw, ok := file["noRefusalHandover"]
+	if !ok {
+		t.Fatalf("settings.json omitted false switch: %s", b)
+	}
+	var saved *bool
+	if err := json.Unmarshal(raw, &saved); err != nil || saved == nil || *saved {
+		t.Fatalf("settings.json noRefusalHandover = %s, want false", raw)
+	}
+}

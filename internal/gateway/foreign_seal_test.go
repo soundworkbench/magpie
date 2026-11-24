@@ -763,6 +763,7 @@ func TestForeignSealedItemsAfterAColdSwitch(t *testing.T) {
 		for _, refusal := range sealRefusals {
 			t.Run(on.name+", refused "+refusal.name, func(t *testing.T) {
 				codexSignedIn(t, "spare@example.com")
+				refusalHandoverOff(t)
 				if err := provider.SetRouting("codex", provider.Ordered); err != nil {
 					t.Fatal(err)
 				}
